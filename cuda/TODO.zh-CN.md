@@ -22,8 +22,8 @@
 
 同卡优化基准测试与原生低精度 GEMM 构建均**已完成**(见 `../BENCHMARK.md`)。剩下:
 
-- **FlashAttention-3 级注意力内核。** 当前 flash 是自写 WMMA 内核(`k_flash_wmma`,1 warp/block,旧 `wmma::` 16×16×16);`nsys` profiling 确认它占 flash 路径时间主导,而当 S/P 物化放得下时 cuBLASLt 批量 perf 路径已快约 3× 且为默认(flash 留作大 S / causal 的省内存路径)。真正 FA3 级内核——warp 特化生产者/消费者、`cp.async`/TMA、ping-pong 双缓冲、tcgen05——是大工程,且调优需要 **Nsight Compute**(占用率/停顿指标),本机只装了 `nsys`。另注:本卡上 cuBLASLt 当前给批量注意力 GEMM 选的是 `cutlass_80_tensorop`(Ampere)内核——这是 cuBLASLt 版本的调优缺口,值得在更新的 cuBLAS 上复查。
-- **降访存流量的生产级融合——剩余算子。** residual+norm(`AddRmsNorm`/`AddLayerNorm`)已构建、修正确性并量化(见 BENCHMARK)。仍未做:fused QKV 投影、attention 进一步免物化(新融合算子)。
+- **FlashAttention-3 级注意力内核。** `ncu` 显示 `k_flash_wmma` 占用率受限(实测 2.84%、1 warp/block、每 block 12.42 KB shared),收益需要完整 FA3 级重写——把每 warp 的 shared 砍到约 4 KB(O 放寄存器、缩 tile)+ warp 特化 `cp.async`/TMA/ping-pong——不是小改。cuBLASLt 批量 perf 路径(约 flash 的 3×)在 S/P 物化放得下时已是默认;flash 留作大 S/causal 的省内存路径。(另:本卡 cuBLASLt 给批量注意力 GEMM 选的是 `cutlass_80_tensorop` Ampere 内核——值得在更新 cuBLAS 上复查。)
+- **降访存流量的生产级融合——剩余算子。** residual+norm(`AddRmsNorm`/`AddLayerNorm`)已构建、修正确性并量化;fused QKV 投影已量化(decode/小 M 区间最高 1.64× —— 是模型层权重拼接,不需后端内核;见 BENCHMARK)。仍未做:融合注意力路径内的进一步免物化。
 - **多卡 / 多节点扩展。** 集合通信正确性仅在 2 机 × 1 卡验证。大规模 ring/tree、非 2 幂 rank、张量/流水并行切分、节点内 NVLink 均须多卡集群。
 
 ## C. 可选的未来结构工作(非硬件绑定)

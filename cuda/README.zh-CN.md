@@ -79,7 +79,7 @@ Blackwell 的 MXFP8 原生微缩放路径（`aclnnMatmulMxFp8Hw`，VEC32_UE8M0 +
 - **缓存显存分配器**：`aclrtMalloc/Free` 走分桶复用，单次 malloc+free 从直通 cudaMalloc 的数百 µs 降到亚 µs，是推理后端地基。
 - **PagedAttention warp-per-row**：寄存器 `acc[D/32]` 替代本地内存 `acc[256]` + 合并 KV 访存，达 ~bandwidth-bound。
 - **权重量化小 M 融合**：W8A16/W4A16 在小 M（解码/小批）直读 int8/int4 权重融合 GEMM，不物化 fp16，省 4×/8× 权重带宽；大 M（prefill）仍解量化 + cuBLASLt 张量核。
-- **访存合并归一化**：RMSNorm/Softmax/GroupNorm —— 以及融合的 `AddRmsNorm`/`AddLayerNorm`（残差加+norm,被 MoE/融合 matmul/mc2 调用）—— 用"一 block 一行 + warp 归约"做合并访存。（这两个融合 add-norm kernel 此前退化成朴素逐行单线程、比独立 RMSNorm 慢约 100×;现已修复,见 `../BENCHMARK.md`。）
+- **访存合并归一化**：RMSNorm/Softmax/GroupNorm 以及融合 add-norm 族（`AddRmsNorm`/`AddLayerNorm`/`AddRmsNormCast`/`DeepNorm`,被 MoE/融合 matmul/mc2 调用）均用"一 block 一行 + warp 归约"做合并访存。
 - **Foreach 多张量融合**：算术类 `aclnnForeach*` 族把整个张量列表融成单次 grid-stride kernel（每张量元信息放调用方 workspace,`grid.y` = 张量下标,仿 PyTorch `MultiTensorApply`），取代逐张量一次启动 —— 对"大量小张量"的优化器状态列表 **43–70×**（`FOREACH_NO_FUSE=1` 回退）。
 - **W8A8 原生 int8 GEMM**：cuBLASLt `CUDA_R_8I` + int32 累加 + per-channel scale epilogue；失败回退 fp16。
 - **MoE 分组 GEMM**：变长分组跨多流重叠，或原生 grouped GEMM（开关）。

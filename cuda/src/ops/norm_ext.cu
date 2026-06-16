@@ -101,17 +101,23 @@ __global__ void k_ln_bwd_fast(const T *dy, const T *x, const T *g, T *dx, float 
 }
 
 // DeepNorm (last dim): y = LayerNorm(alpha·x + gx) · gamma + beta (LayerNorm after DeepNet residual scaling)
-template <typename T>
+// DeepNorm = LayerNorm(alpha·x + gx)·γ + β. One block per row, coalesced access + warp/block reduction
+// (single-pass Σ and Σ² → mean/var, same scheme as k_gn_fast / k_add_layernorm).
+template <typename T, int TB>
 __global__ void k_deepnorm(const T *x, const T *gx, const T *g, const T *b, T *o, int64_t rows, int64_t D, float alpha, float eps) {
-    int64_t r = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; if (r >= rows) return;
-    int64_t base = r * D;
-    double mean = 0; for (int64_t d = 0; d < D; ++d) mean += alpha * (float)x[base+d] + (float)gx[base+d]; mean /= D;
-    double var = 0; for (int64_t d = 0; d < D; ++d) { double t = alpha*(float)x[base+d] + (float)gx[base+d] - mean; var += t*t; } var /= D;
-    float rstd = rsqrtf((float)var + eps);
-    for (int64_t d = 0; d < D; ++d) {
-        float tmp = alpha * (float)x[base+d] + (float)gx[base+d], xhat = (tmp - (float)mean) * rstd;
-        o[base+d] = (T)(xhat * (g ? (float)g[d] : 1.f) + (b ? (float)b[d] : 0.f));
-    }
+    int64_t r = blockIdx.x; if (r >= rows) return;
+    int64_t base = r * D; int t = threadIdx.x;
+    float sum = 0, sq = 0;
+    for (int64_t d = t; d < D; d += TB) { float tmp = alpha * (float)x[base+d] + (float)gx[base+d]; sum += tmp; sq += tmp * tmp; }
+    #pragma unroll
+    for (int o2 = 16; o2 > 0; o2 >>= 1) { sum += __shfl_down_sync(0xffffffffu, sum, o2); sq += __shfl_down_sync(0xffffffffu, sq, o2); }
+    __shared__ float ssum[TB / 32], ssq[TB / 32];
+    if ((t & 31) == 0) { ssum[t >> 5] = sum; ssq[t >> 5] = sq; } __syncthreads();
+    __shared__ float mean, rstd;
+    if (t == 0) { float a = 0, q = 0; for (int w = 0; w < TB / 32; w++) { a += ssum[w]; q += ssq[w]; }
+        mean = a / D; float var = q / D - mean * mean; rstd = rsqrtf(var + eps); } __syncthreads();
+    for (int64_t d = t; d < D; d += TB) { float tmp = alpha * (float)x[base+d] + (float)gx[base+d];
+        o[base+d] = (T)(((tmp - mean) * rstd) * (g ? (float)g[d] : 1.f) + (b ? (float)b[d] : 0.f)); }
 }
 
 // Fused AddRmsNorm = RmsNorm(x+res)·γ, outputs the residual sum. One block per row, coalesced access +
@@ -287,8 +293,8 @@ aclnnStatus aclnnDeepNormGetWorkspaceSize(const aclTensor *x, const aclTensor *g
 }
 aclnnStatus aclnnDeepNorm(void *, uint64_t, aclOpExecutor *e, aclrtStream s) {
     if (!e) return ACLNN_ERR_PARAM_INVALID;
-    int64_t rows = e->outerCount, Dd = e->reduceCount; int64_t g = nb(rows); auto st = (cudaStream_t)s;
-    DISP3(( k_deepnorm<T><<<g,TH,0,st>>>((const T*)e->a->data,(const T*)e->b->data,(const T*)D(e->c),(const T*)D(e->mask),(T*)e->out->data,rows,Dd,(float)e->alpha,(float)e->eps) ));
+    int64_t rows = e->outerCount, Dd = e->reduceCount; auto st = (cudaStream_t)s;
+    DISP3(( k_deepnorm<T,TH><<<(unsigned)rows,TH,0,st>>>((const T*)e->a->data,(const T*)e->b->data,(const T*)D(e->c),(const T*)D(e->mask),(T*)e->out->data,rows,Dd,(float)e->alpha,(float)e->eps) ));
     return finish(e);
 }
 
@@ -677,13 +683,19 @@ constexpr int TH = 256;
 inline int64_t nb(int64_t n){ return (n+TH-1)/TH; }
 
 // y = rms(x+res)·gamma over last dim D; ysum = x+res; yCast = (TC)y (optional). Reads ysum in pass 2 → alias-safe.
-template <typename T, typename TC>
+template <typename T, typename TC, int TB>
 __global__ void k_add_rmsnorm_cast(const T *x, const T *res, const T *g, T *ysum, T *y, TC *yCast, int64_t rows, int64_t D, float eps) {
-    int64_t r = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; if (r >= rows) return;
-    int64_t base = r * D; double ss = 0;
-    for (int64_t d = 0; d < D; ++d) { float t = (float)x[base+d] + (float)res[base+d]; ss += (double)t * t; ysum[base+d] = (T)t; }
-    float inv = rsqrtf((float)(ss / D) + eps);
-    for (int64_t d = 0; d < D; ++d) { float yv = (float)ysum[base+d] * inv * (g ? (float)g[d] : 1.f);
+    int64_t r = blockIdx.x; if (r >= rows) return;
+    int64_t base = r * D; int t = threadIdx.x;
+    float ss = 0;
+    for (int64_t d = t; d < D; d += TB) { float v = (float)x[base+d] + (float)res[base+d]; ysum[base+d] = (T)v; ss += v * v; }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+    __shared__ float sh[TB / 32];
+    if ((t & 31) == 0) sh[t >> 5] = ss; __syncthreads();
+    if (t == 0) { float tot = 0; for (int w = 0; w < TB / 32; w++) tot += sh[w]; sh[0] = tot; } __syncthreads();
+    float inv = rsqrtf(sh[0] / D + eps);
+    for (int64_t d = t; d < D; d += TB) { float yv = (float)ysum[base+d] * inv * (g ? (float)g[d] : 1.f);
         y[base+d] = (T)yv; if (yCast) yCast[base+d] = (TC)yv; }
 }
 
@@ -712,12 +724,12 @@ __global__ void k_adaln(const T *x, const T *scale, const T *shift, T *y, int64_
 template <typename T>
 static void launch_castT(aclOpExecutor *e, int64_t rows, int64_t D, cudaStream_t st) {
     const T *x=(const T*)e->a->data,*res=(const T*)e->b->data,*g=(const T*)D_(e->c);
-    T *ysum=(T*)e->out2->data, *y=(T*)e->out->data; int64_t blk=nb(rows); float eps=(float)e->eps;
-    if (!e->mask) { k_add_rmsnorm_cast<T,T><<<blk,TH,0,st>>>(x,res,g,ysum,y,(T*)nullptr,rows,D,eps); return; }
+    T *ysum=(T*)e->out2->data, *y=(T*)e->out->data; unsigned blk=(unsigned)rows; float eps=(float)e->eps;
+    if (!e->mask) { k_add_rmsnorm_cast<T,T,TH><<<blk,TH,0,st>>>(x,res,g,ysum,y,(T*)nullptr,rows,D,eps); return; }
     switch (e->mask->dtype) {
-        case ACL_FLOAT16: k_add_rmsnorm_cast<T,__half><<<blk,TH,0,st>>>(x,res,g,ysum,y,(__half*)e->mask->data,rows,D,eps); break;
-        case ACL_BF16:    k_add_rmsnorm_cast<T,__nv_bfloat16><<<blk,TH,0,st>>>(x,res,g,ysum,y,(__nv_bfloat16*)e->mask->data,rows,D,eps); break;
-        default:          k_add_rmsnorm_cast<T,float><<<blk,TH,0,st>>>(x,res,g,ysum,y,(float*)e->mask->data,rows,D,eps); break;
+        case ACL_FLOAT16: k_add_rmsnorm_cast<T,__half,TH><<<blk,TH,0,st>>>(x,res,g,ysum,y,(__half*)e->mask->data,rows,D,eps); break;
+        case ACL_BF16:    k_add_rmsnorm_cast<T,__nv_bfloat16,TH><<<blk,TH,0,st>>>(x,res,g,ysum,y,(__nv_bfloat16*)e->mask->data,rows,D,eps); break;
+        default:          k_add_rmsnorm_cast<T,float,TH><<<blk,TH,0,st>>>(x,res,g,ysum,y,(float*)e->mask->data,rows,D,eps); break;
     }
 }
 

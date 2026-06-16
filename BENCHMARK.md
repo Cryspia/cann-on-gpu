@@ -114,7 +114,20 @@ Fused residual-add + RMSNorm (1 kernel, intermediate `x+res` kept on-chip / hot 
 | 4096 × 8192 | L2 edge | 0.1592 ms | 0.1539 ms | 0.97× |
 | 8192 × 8192 | DRAM-bound | 0.3205 ms | 0.3820 ms | **1.19×** |
 
-**Finding:** the fusion win **grows with working-set size** — when the intermediate would round-trip DRAM (large rows×D) fusion saves that traffic (+ one launch) for **~1.2×**; when the working set is L2-resident there is no DRAM round-trip to remove, so fused ≈ unfused. *(Tried pushing to the bandwidth-optimal 4-transfer path by register-caching `x+res` across both passes to skip the `ysum` reload — it **regressed** (0.34 vs 0.32 ms at 8192²): 32 floats/thread spills registers and collapses occupancy, worse than reloading the freshly-written `ysum` from hot L2. Reverted; the reload kernel is kept.)* *(Note: this A/B also surfaced and fixed a real bug — the fused `AddRmsNorm`/`AddLayerNorm` kernels had been a naive one-thread-per-row, uncoalesced, serial-reduction implementation ~100× slower than the standalone RMSNorm; they are now one-block-per-row + coalesced + warp-reduction, matching `k_rms_fast`. These ops are called internally by MoE / fused-matmul / mc2, which all paid that cost.)*
+**Finding:** the fusion win **grows with working-set size** — when the intermediate would round-trip DRAM (large rows×D) fusion saves that traffic (+ one launch) for **~1.2×**; when the working set is L2-resident there is no DRAM round-trip to remove, so fused ≈ unfused. *(The fused add-norm family — `AddRmsNorm`/`AddLayerNorm`/`AddRmsNormCast`/`DeepNorm`, used internally by MoE / fused-matmul / mc2 — uses one-block-per-row + coalesced + warp-reduction, matching `k_rms_fast`: e.g. DeepNorm 0.026 ms and AddRmsNormCast 0.094 ms at 4096² fp16, ~40–140× a one-thread-per-row baseline.)*
+
+### Fused QKV projection (one `[K,3N]` GEMM vs three `[K,N]` GEMMs)
+
+Concatenating the Q/K/V projection weights into one matmul (same total FLOPs; reads the input activation once, one launch, one larger GEMM). fp16, K=N=4096:
+
+| M (tokens) | Regime | 3× separate | Fused [K,3N] | Speedup |
+|---|---|---|---|---|
+| 8 | decode | 0.0260 ms | 0.0216 ms | 1.21× |
+| 64 | small-batch decode | 0.0478 ms | 0.0291 ms | **1.64×** |
+| 512 | — | 0.1427 ms | 0.1356 ms | 1.05× |
+| 4096 | prefill | 0.8747 ms | 0.8707 ms | 1.00× |
+
+**Finding:** fusion helps most in the **decode / small-M regime** (up to **1.64×**), where three separate projections are launch- and weight-load-bound; at prefill it is compute-bound (identical FLOPs) so the gain vanishes. This needs no backend kernel — it's a model-level transform (pack the three projection weights and issue one `aclnnMatmul`), so the guidance is: **concatenate QKV weights for decode-heavy inference**.
 
 ### Native MXFP8 microscaling GEMM (`MXFP8_NO_HW=1` forces the functional path)
 
@@ -149,6 +162,8 @@ The native-tensor-core low-precision GEMM paths already exist and are tolerance-
 |---|---|---|---|
 | 4096³ | 322 TFLOP/s | 372 TFLOP/s | 0.87× |
 | 8192³ | 398 TFLOP/s | 438 TFLOP/s | 0.91× |
+
+**fp6 (E2M3/E3M2):** fp6 plain matmul decodes losslessly to fp8-e4m3 and runs the native fp8 GEMM, reaching **554 TFLOP/s @ 8192³** (fp6 and fp8 share the Blackwell tensor-core datapath, so this is already ~92% of the fp8 ceiling).
 
 **Caveat:** the `aclnnMatmulMxFp4Hw` path requests `VEC32_UE8M0`, which **this cuBLASLt rejects for fp4** (it accepts only NVFP4 `VEC16_UE4M3`), so it silently falls back to the functional path — that's why the "native" MXFP4 numbers above equal the functional ones. The true native fp4 rate requires the NVFP4 path below.
 
