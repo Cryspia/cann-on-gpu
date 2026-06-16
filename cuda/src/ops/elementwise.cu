@@ -391,17 +391,24 @@ __global__ void k_un_vec(const T *a, T *o, int64_t nvec) {
     for (int k = 0; k < VEC; k++) vo.d[k] = (T)F<A>::f((A)va.d[k]);
     ((VecT<T, VEC> *)o)[v] = vo;
 }
+// ELTWISE_NO_VEC=1 forces the scalar (1 element/thread) path even when the 16B vector path is eligible —
+// for same-card A/B measurement of the 128-bit vectorized-access optimization.
+static inline bool eltwise_vec_enabled() {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("ELTWISE_NO_VEC"); v = (e && e[0] && e[0] != '0') ? 0 : 1; }
+    return v != 0;
+}
 template <typename T, typename A, template <typename> class F>
 static inline void bin_fast(const T *a, const T *b, T *o, A al, int64_t n, cudaStream_t s) {
     constexpr int VEC = 16 / sizeof(T);
-    if (VEC > 1 && (n % VEC) == 0) { int64_t nv = n / VEC, g = (nv + THREADS - 1) / THREADS;
+    if (VEC > 1 && (n % VEC) == 0 && eltwise_vec_enabled()) { int64_t nv = n / VEC, g = (nv + THREADS - 1) / THREADS;
         k_bin_vec<T, A, F><<<g, THREADS, 0, s>>>(a, b, o, al, nv); }
     else { int64_t g = (n + THREADS - 1) / THREADS; k_bin<T, A, F><<<g, THREADS, 0, s>>>(a, b, o, al, n); }
 }
 template <typename T, typename A, template <typename> class F>
 static inline void un_fast(const T *a, T *o, int64_t n, cudaStream_t s) {
     constexpr int VEC = 16 / sizeof(T);
-    if (VEC > 1 && (n % VEC) == 0) { int64_t nv = n / VEC, g = (nv + THREADS - 1) / THREADS;
+    if (VEC > 1 && (n % VEC) == 0 && eltwise_vec_enabled()) { int64_t nv = n / VEC, g = (nv + THREADS - 1) / THREADS;
         k_un_vec<T, A, F><<<g, THREADS, 0, s>>>(a, o, nv); }
     else { int64_t g = (n + THREADS - 1) / THREADS; k_un<T, A, F><<<g, THREADS, 0, s>>>(a, o, n); }
 }

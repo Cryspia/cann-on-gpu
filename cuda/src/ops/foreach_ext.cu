@@ -1,11 +1,11 @@
 // Foreach op family (ops-nn / foreach, 70 ops): apply one elementwise operation across every tensor
-// in an aclTensorList. The functional landing loops over the list and reuses the single-tensor
-// elementwise dispatch (ew_run_one) per tensor; a few shapes (scalar^tensor, list-lerp, norm,
-// non-finite-check, copy/zero) use small dedicated kernels here.
-//
-// Performance note: this issues one kernel launch per tensor. Fusing the whole list into a single
-// multi-tensor kernel (one launch, grid-stride over a packed tensor-meta array) is recorded as a
-// backlog item in cuda/TODO.md Part B and intentionally deferred.
+// in an aclTensorList. The arithmetic variants are fused into a single multi-tensor kernel launch
+// (one grid-strided kernel over a packed per-tensor metadata array staged in the caller workspace,
+// in the style of PyTorch's MultiTensorApply) — removing the per-tensor launch overhead that dominated
+// optimizer-state updates with many small parameter tensors. Non-contiguous tensors, mixed dtypes, or
+// the reduction/flag variants (norm, non-finite-check) fall back to the per-tensor dispatch loop
+// (ew_run_one), which also handles strided views. Set FOREACH_NO_FUSE=1 to force the legacy loop
+// (for A/B comparison and as a safety escape hatch).
 #include "../internal.h"
 #include "aclnnop/aclnn_ops.h"
 #include <cuda_fp16.h>
@@ -72,11 +72,115 @@ template <typename T> __global__ void k_norm(const T *x, float *out, float p, in
     case ACL_BF16:    KCALL(__nv_bfloat16); break; \
     default: st = ACLNN_ERR_PARAM_INVALID; }
 
+// ---------------- multi-tensor fused path ----------------
+// One launch over the whole list: grid.y selects the tensor (its pointers/length come from a packed
+// FMeta array in the workspace), grid.x + grid-stride cover that tensor's elements.
+
+inline bool foreach_fuse_enabled() {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("FOREACH_NO_FUSE"); v = (e && e[0] && e[0] != '0') ? 0 : 1; }
+    return v != 0;
+}
+
+// Per-tensor metadata. p[] holds the participating buffers in group order (x, [g1], [g2], [out]),
+// each already advanced by the tensor's element offset. sc is the per-tensor scalar (variant-specific).
+struct FMeta { const void *p[4]; int64_t n; float sc; };
+
+// Which variants the fused kernel handles (the arithmetic/copy ones — not norm/non-finite reductions).
+inline bool fe_fusable(int variant) {
+    switch (variant) {
+        case FV_UNARY: case FV_SCALAR: case FV_SCALARLIST: case FV_LIST:
+        case FV_ADDC: case FV_LERP_SCALAR: case FV_LERP_LIST:
+        case FV_POWSAT: case FV_COPY: case FV_ZERO: return true;
+        default: return false;
+    }
+}
+// Workspace bytes the fused path needs (0 for non-fusable variants or when fusion is toggled off →
+// caller allocates nothing extra and the legacy loop's footprint is unchanged).
+inline uint64_t fe_ws_bytes(int variant, int64_t N) {
+    return (foreach_fuse_enabled() && fe_fusable(variant)) ? (uint64_t)N * sizeof(FMeta) : 0;
+}
+
+__device__ inline float fe_unary_apply(int op, float x) {
+    switch (op) {
+        case OP_ABS:        return fabsf(x);
+        case OP_ACOS:       return acosf(x);
+        case OP_ASIN:       return asinf(x);
+        case OP_ATAN:       return atanf(x);
+        case OP_COS:        return cosf(x);
+        case OP_COSH:       return coshf(x);
+        case OP_ERF:        return erff(x);
+        case OP_ERFC:       return erfcf(x);
+        case OP_EXP:        return expf(x);
+        case OP_EXPM1:      return expm1f(x);
+        case OP_LOG:        return logf(x);
+        case OP_LOG10:      return log10f(x);
+        case OP_LOG1P:      return log1pf(x);
+        case OP_LOG2:       return log2f(x);
+        case OP_NEG:        return -x;
+        case OP_RECIPROCAL: return 1.0f / x;
+        case OP_SIGMOID:    return 1.0f / (1.0f + expf(-x));
+        case OP_SIGN:       return (float)((x > 0.0f) - (x < 0.0f));
+        case OP_SIN:        return sinf(x);
+        case OP_SINH:       return sinhf(x);
+        case OP_SQRT:       return sqrtf(x);
+        case OP_TAN:        return tanf(x);
+        case OP_TANH:       return tanhf(x);
+        case OP_ROUND:      return rintf(x);   // banker's rounding (matches FRound / PyTorch)
+    }
+    return x;
+}
+// Binary apply shared by list ops and tensor∘scalar ops (scalar fed as b, alpha=1) — mirrors the
+// elementwise functors: Add/Sub use a±alpha·b; Mul/Div/Max/Min/Pow ignore alpha.
+__device__ inline float fe_binary_apply(int op, float a, float b, float al) {
+    switch (op) {
+        case OP_ADD: case OP_ADDS:       return a + al * b;
+        case OP_SUB: case OP_SUBS:       return a - al * b;
+        case OP_MUL: case OP_MULS:       return a * b;
+        case OP_DIV: case OP_DIVS:       return a / b;
+        case OP_MAXIMUM: case OP_CLAMP_MIN: return a > b ? a : b;
+        case OP_MINIMUM: case OP_CLAMP_MAX: return a < b ? a : b;
+        case OP_POW: case OP_POWS:       return powf(a, b);
+    }
+    return a;
+}
+
+template <typename T>
+__global__ void k_foreach_fused(const FMeta *meta, int variant, int op) {
+    const FMeta m = meta[blockIdx.y];
+    const int64_t n = m.n;
+    const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    const T *x = (const T *)m.p[0];
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        float xv = fld(x[i]);
+        float r; T *out;
+        switch (variant) {
+            case FV_UNARY:       r = fe_unary_apply(op, xv);                         out = (T *)m.p[1]; break;
+            case FV_SCALAR:
+            case FV_SCALARLIST:  r = fe_binary_apply(op, xv, m.sc, 1.0f);            out = (T *)m.p[1]; break;
+            case FV_LIST:        r = fe_binary_apply(op, xv, fld(((const T *)m.p[1])[i]), m.sc); out = (T *)m.p[2]; break;
+            case FV_ADDC: {
+                float t1 = fld(((const T *)m.p[1])[i]), t2 = fld(((const T *)m.p[2])[i]);
+                r = xv + m.sc * (op == OP_ADDCDIV ? t1 / t2 : t1 * t2);              out = (T *)m.p[3]; break; }
+            case FV_LERP_SCALAR: r = xv + m.sc * (fld(((const T *)m.p[1])[i]) - xv); out = (T *)m.p[2]; break;
+            case FV_LERP_LIST: {
+                float e = fld(((const T *)m.p[1])[i]), w = fld(((const T *)m.p[2])[i]);
+                r = xv + w * (e - xv);                                              out = (T *)m.p[3]; break; }
+            case FV_POWSAT:      r = powf(m.sc, xv);                                 out = (T *)m.p[1]; break;
+            case FV_COPY:        r = xv;                                            out = (T *)m.p[1]; break;
+            case FV_ZERO:        r = 0.0f;                                          out = (T *)m.p[0]; break;
+            default:             return;
+        }
+        out[i] = fst<T>(r);
+    }
+}
+
 // Flatten the participating lists into e->inputs in group order (x, [g1], [g2], [out]).
 // All lists must have the same length N; every tensor must be non-null with device data.
+// Also reports the fused-path workspace size (0 when the variant isn't fused).
 aclnnStatus fe_build(int op, int variant, const aclTensorList *x, const aclTensorList *g1,
                      const aclTensorList *g2, const aclTensorList *out,
-                     const std::vector<double> &sc, aclOpExecutor **ex) {
+                     const std::vector<double> &sc, aclOpExecutor **ex, uint64_t *ws) {
     if (!x || !ex) return ACLNN_ERR_PARAM_NULLPTR;
     int64_t N = (int64_t)x->v.size();
     if (N == 0) return ACLNN_ERR_PARAM_INVALID;
@@ -92,6 +196,7 @@ aclnnStatus fe_build(int op, int variant, const aclTensorList *x, const aclTenso
     if (st == ACLNN_SUCCESS && g2) st = push(g2);
     if (st == ACLNN_SUCCESS && out) st = push(out);
     if (st != ACLNN_SUCCESS) { delete e; return st; }
+    if (ws) *ws = fe_ws_bytes(variant, N);
     *ex = e;
     return ACLNN_SUCCESS;
 }
@@ -109,9 +214,65 @@ aclnnStatus read_scalars(const aclTensor *s, int64_t N, std::vector<double> &out
 
 inline aclTensor *CC(const aclTensor *t) { return const_cast<aclTensor *>(t); }
 
-// Shared Execute: walk the list and dispatch per tensor. Frees the executor (CANN one-shot semantics).
+// Attempt the fused single-launch path. Returns true if it handled the op (status in *out),
+// false to fall back to the per-tensor loop (mixed dtype / non-contiguous / unsupported variant / no ws).
+bool fe_try_fused(aclOpExecutor *e, void *ws, cudaStream_t s, aclnnStatus *out) {
+    const int variant = e->n;
+    if (!foreach_fuse_enabled() || !ws || !fe_fusable(variant)) return false;
+    const int64_t N = e->m;
+    if (N <= 0 || N > 65535) return false;                 // grid.y limit
+    const int G = (int)((int64_t)e->inputs.size() / N);
+    const aclDataType dt = e->inputs[0]->dtype;
+    if (dt != ACL_FLOAT && dt != ACL_FLOAT16 && dt != ACL_BF16) return false;
+    const size_t esz = dtype_size(dt);
+
+    std::vector<FMeta> h(N);
+    int64_t maxn = 0;
+    for (int64_t i = 0; i < N; ++i) {
+        FMeta m{};
+        for (int g = 0; g < G; ++g) {
+            const aclTensor *t = e->inputs[g * N + i];
+            if (!t || !t->data || t->dtype != dt || !t->contiguous()) return false;  // bail → legacy loop
+            m.p[g] = (const char *)t->data + t->offset * esz;
+        }
+        m.n = e->inputs[i]->numel();
+        switch (variant) {
+            case FV_SCALAR:      m.sc = (float)e->dscalars[0]; break;
+            case FV_SCALARLIST:  m.sc = (float)e->dscalars[i]; break;
+            case FV_LIST:        m.sc = e->dscalars.empty() ? 1.0f : (float)e->dscalars[0]; break;
+            case FV_ADDC:        m.sc = (float)(e->dscalars.size() == 1 ? e->dscalars[0] : e->dscalars[i]); break;
+            case FV_LERP_SCALAR: m.sc = (float)e->dscalars[0]; break;
+            case FV_POWSAT:      m.sc = (float)e->dscalars[0]; break;
+            default:             m.sc = 0.0f;
+        }
+        h[i] = m;
+        if (m.n > maxn) maxn = m.n;
+    }
+    if (maxn == 0) { *out = ACLNN_SUCCESS; return true; }   // all-empty list: nothing to do
+
+    // Stage metadata into the caller workspace (synchronous copy: tiny, and keeps the host source
+    // alive until the launch). The compute kernel itself runs async on the stream.
+    if (cudaMemcpy(ws, h.data(), (size_t)N * sizeof(FMeta), cudaMemcpyHostToDevice) != cudaSuccess)
+        return false;
+    int64_t bx = fgrid(maxn); if (bx < 1) bx = 1; if (bx > 2048) bx = 2048;
+    dim3 grid((unsigned)bx, (unsigned)N, 1);
+    const FMeta *md = (const FMeta *)ws;
+    const int op = e->op;
+    aclnnStatus st = ACLNN_SUCCESS;
+    #define KFUSE(T) k_foreach_fused<T><<<grid, FT, 0, s>>>(md, variant, op)
+    FDISP(KFUSE)
+    #undef KFUSE
+    *out = (st == ACLNN_SUCCESS && cudaGetLastError() == cudaSuccess) ? ACLNN_SUCCESS : ACLNN_ERR_RUNTIME_ERROR;
+    return true;
+}
+
+// Shared Execute: try the fused path first, else walk the list and dispatch per tensor.
+// Frees the executor (CANN one-shot semantics).
 aclnnStatus fe_run(aclOpExecutor *e, void *ws, cudaStream_t s) {
     if (!e) return ACLNN_ERR_PARAM_INVALID;
+    aclnnStatus fused;
+    if (fe_try_fused(e, ws, s, &fused)) { delete e; return fused; }
+
     const int64_t N = e->m;
     const aclTensor **in = e->inputs.data();
     aclnnStatus st = ACLNN_SUCCESS;
@@ -185,7 +346,7 @@ extern "C" {
 aclnnStatus NAME##GetWorkspaceSize(const aclTensorList *x, const aclTensorList *out,                         \
                                    uint64_t *ws, aclOpExecutor **ex) {                                       \
     if (!ws) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;                                                        \
-    return fe_build(OP, FV_UNARY, x, nullptr, nullptr, out, {}, ex); }                                       \
+    return fe_build(OP, FV_UNARY, x, nullptr, nullptr, out, {}, ex, ws); }                                   \
 aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
 // ---- per-tensor, single scalar applied to all (Scalar and ScalarV2 share this) ----
@@ -193,7 +354,7 @@ aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return f
 aclnnStatus NAME##GetWorkspaceSize(const aclTensorList *x, const aclScalar *scalar,                          \
                                    const aclTensorList *out, uint64_t *ws, aclOpExecutor **ex) {             \
     if (!ws || !scalar) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;                                             \
-    return fe_build(OP, FV_SCALAR, x, nullptr, nullptr, out, {scalar->v}, ex); }                            \
+    return fe_build(OP, FV_SCALAR, x, nullptr, nullptr, out, {scalar->v}, ex, ws); }                         \
 aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
 // ---- per-tensor scalar list (scalars given as a 1-D fp32 tensor of length N) ----
@@ -203,7 +364,7 @@ aclnnStatus NAME##GetWorkspaceSize(const aclTensorList *x, const aclTensor *scal
     if (!ws || !x) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;                                                  \
     std::vector<double> sc; aclnnStatus st = read_scalars(scalars, (int64_t)x->v.size(), sc);               \
     if (st != ACLNN_SUCCESS) return st;                                                                      \
-    return fe_build(OP, FV_SCALARLIST, x, nullptr, nullptr, out, sc, ex); }                                  \
+    return fe_build(OP, FV_SCALARLIST, x, nullptr, nullptr, out, sc, ex, ws); }                              \
 aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
 // ---- per-tensor binary between two lists ----
@@ -211,7 +372,7 @@ aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return f
 aclnnStatus NAME##GetWorkspaceSize(const aclTensorList *x, const aclTensorList *y,                           \
                                    const aclTensorList *out, uint64_t *ws, aclOpExecutor **ex) {             \
     if (!ws) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;                                                        \
-    return fe_build(OP, FV_LIST, x, y, nullptr, out, {}, ex); }                                              \
+    return fe_build(OP, FV_LIST, x, y, nullptr, out, {}, ex, ws); }                                          \
 aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
 // ---- per-tensor binary between two lists with a scalar alpha (Add/Sub V2) ----
@@ -219,7 +380,7 @@ aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return f
 aclnnStatus NAME##GetWorkspaceSize(const aclTensorList *x, const aclTensorList *y, const aclScalar *alpha,   \
                                    const aclTensorList *out, uint64_t *ws, aclOpExecutor **ex) {             \
     if (!ws) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;                                                        \
-    return fe_build(OP, FV_LIST, x, y, nullptr, out, {alpha ? alpha->v : 1.0}, ex); }                        \
+    return fe_build(OP, FV_LIST, x, y, nullptr, out, {alpha ? alpha->v : 1.0}, ex, ws); }                     \
 aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
 // ---- addcmul / addcdiv with one scalar (Scalar and ScalarV2 share this) ----
@@ -228,7 +389,7 @@ aclnnStatus NAME##GetWorkspaceSize(const aclTensorList *x, const aclTensorList *
                                    const aclScalar *scalar, const aclTensorList *out,                        \
                                    uint64_t *ws, aclOpExecutor **ex) {                                       \
     if (!ws) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;                                                        \
-    return fe_build(OP, FV_ADDC, x, t1, t2, out, {scalar ? scalar->v : 1.0}, ex); }                          \
+    return fe_build(OP, FV_ADDC, x, t1, t2, out, {scalar ? scalar->v : 1.0}, ex, ws); }                       \
 aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
 // ---- addcmul / addcdiv with per-tensor scalars (ScalarList and List share this) ----
@@ -239,7 +400,7 @@ aclnnStatus NAME##GetWorkspaceSize(const aclTensorList *x, const aclTensorList *
     if (!ws || !x) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;                                                  \
     std::vector<double> sc; aclnnStatus st = read_scalars(scalars, (int64_t)x->v.size(), sc);               \
     if (st != ACLNN_SUCCESS) return st;                                                                      \
-    return fe_build(OP, FV_ADDC, x, t1, t2, out, sc, ex); }                                                  \
+    return fe_build(OP, FV_ADDC, x, t1, t2, out, sc, ex, ws); }                                              \
 aclnnStatus NAME(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
 // ===== unary (23 + 2 round) =====
@@ -319,7 +480,7 @@ DEF_ADDC_LIST(aclnnForeachAddcdivList, OP_ADDCDIV)
 aclnnStatus aclnnForeachPowScalarAndTensorGetWorkspaceSize(const aclScalar *scalar, const aclTensorList *x,
                                                            const aclTensorList *out, uint64_t *ws, aclOpExecutor **ex) {
     if (!ws || !scalar) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;
-    return fe_build(0, FV_POWSAT, x, nullptr, nullptr, out, {scalar->v}, ex);
+    return fe_build(0, FV_POWSAT, x, nullptr, nullptr, out, {scalar->v}, ex, ws);
 }
 aclnnStatus aclnnForeachPowScalarAndTensor(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
@@ -327,25 +488,25 @@ aclnnStatus aclnnForeachPowScalarAndTensor(void *ws, uint64_t, aclOpExecutor *e,
 aclnnStatus aclnnForeachLerpScalarGetWorkspaceSize(const aclTensorList *x, const aclTensorList *end, const aclScalar *weight,
                                                    const aclTensorList *out, uint64_t *ws, aclOpExecutor **ex) {
     if (!ws) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;
-    return fe_build(OP_LERP, FV_LERP_SCALAR, x, end, nullptr, out, {weight ? weight->v : 0.0}, ex);
+    return fe_build(OP_LERP, FV_LERP_SCALAR, x, end, nullptr, out, {weight ? weight->v : 0.0}, ex, ws);
 }
 aclnnStatus aclnnForeachLerpScalar(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 aclnnStatus aclnnForeachLerpListGetWorkspaceSize(const aclTensorList *x, const aclTensorList *end, const aclTensorList *weight,
                                                  const aclTensorList *out, uint64_t *ws, aclOpExecutor **ex) {
     if (!ws) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;
-    return fe_build(0, FV_LERP_LIST, x, end, weight, out, {}, ex);
+    return fe_build(0, FV_LERP_LIST, x, end, weight, out, {}, ex, ws);
 }
 aclnnStatus aclnnForeachLerpList(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
 // ===== copy / zero =====
 aclnnStatus aclnnForeachCopyGetWorkspaceSize(const aclTensorList *x, const aclTensorList *out, uint64_t *ws, aclOpExecutor **ex) {
     if (!ws) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;
-    return fe_build(0, FV_COPY, x, nullptr, nullptr, out, {}, ex);
+    return fe_build(0, FV_COPY, x, nullptr, nullptr, out, {}, ex, ws);
 }
 aclnnStatus aclnnForeachCopy(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 aclnnStatus aclnnForeachZeroInplaceGetWorkspaceSize(const aclTensorList *x, uint64_t *ws, aclOpExecutor **ex) {
     if (!ws) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;
-    return fe_build(0, FV_ZERO, x, nullptr, nullptr, nullptr, {}, ex);
+    return fe_build(0, FV_ZERO, x, nullptr, nullptr, nullptr, {}, ex, ws);
 }
 aclnnStatus aclnnForeachZeroInplace(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) { return fe_run(e, ws, (cudaStream_t)s); }
 
@@ -353,7 +514,7 @@ aclnnStatus aclnnForeachZeroInplace(void *ws, uint64_t, aclOpExecutor *e, aclrtS
 aclnnStatus aclnnForeachNormGetWorkspaceSize(const aclTensorList *x, const aclScalar *p, aclTensor *out,
                                              uint64_t *ws, aclOpExecutor **ex) {
     if (!ws || !out || !out->data) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;
-    aclnnStatus st = fe_build(0, FV_NORM, x, nullptr, nullptr, nullptr, {p ? p->v : 2.0}, ex);
+    aclnnStatus st = fe_build(0, FV_NORM, x, nullptr, nullptr, nullptr, {p ? p->v : 2.0}, ex, ws);
     if (st == ACLNN_SUCCESS) (*ex)->out = out;
     return st;
 }
@@ -363,7 +524,7 @@ aclnnStatus aclnnForeachNorm(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s
 aclnnStatus aclnnForeachNonFiniteCheckAndUnscaleGetWorkspaceSize(const aclTensorList *x, aclTensor *foundInf,
                                                                  const aclTensor *invScale, uint64_t *ws, aclOpExecutor **ex) {
     if (!ws || !foundInf || !foundInf->data || !invScale || !invScale->data) return ACLNN_ERR_PARAM_NULLPTR; *ws = 0;
-    aclnnStatus st = fe_build(0, FV_NONFINITE, x, nullptr, nullptr, nullptr, {}, ex);
+    aclnnStatus st = fe_build(0, FV_NONFINITE, x, nullptr, nullptr, nullptr, {}, ex, ws);
     if (st == ACLNN_SUCCESS) { (*ex)->out = foundInf; (*ex)->b = invScale; }
     return st;
 }

@@ -114,26 +114,40 @@ __global__ void k_deepnorm(const T *x, const T *gx, const T *g, const T *b, T *o
     }
 }
 
-// Fused AddRmsNorm = RmsNorm(x+res)·γ, also outputs the residual sum (x+res)
-template <typename T>
+// Fused AddRmsNorm = RmsNorm(x+res)·γ, outputs the residual sum. One block per row, coalesced access +
+// warp/block reduction (same scheme as k_rms_fast). First pass writes ysum=x+res and accumulates Σ(x+res)²;
+// second pass reads ysum back (one array, hot in L2) — avoiding the unfused Add→DRAM→RmsNorm round-trip.
+template <typename T, int TB>
 __global__ void k_add_rmsnorm(const T *x, const T *res, const T *g, T *ysum, T *y, int64_t rows, int64_t D, float eps) {
-    int64_t r = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; if (r >= rows) return;
-    int64_t base = r * D; double ss = 0;
-    for (int64_t d = 0; d < D; ++d) { float t = (float)x[base+d] + (float)res[base+d]; ss += (double)t * t; ysum[base+d] = (T)t; }
-    float inv = rsqrtf((float)(ss / D) + eps);
-    for (int64_t d = 0; d < D; ++d) { float t = (float)x[base+d] + (float)res[base+d]; y[base+d] = (T)(t * inv * (g ? (float)g[d] : 1.f)); }
+    int64_t r = blockIdx.x; if (r >= rows) return;
+    int64_t base = r * D; int t = threadIdx.x;
+    float ss = 0;
+    for (int64_t d = t; d < D; d += TB) { float v = (float)x[base+d] + (float)res[base+d]; ysum[base+d] = (T)v; ss += v * v; }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+    __shared__ float sh[TB / 32];
+    if ((t & 31) == 0) sh[t >> 5] = ss; __syncthreads();
+    if (t == 0) { float tot = 0; for (int w = 0; w < TB / 32; w++) tot += sh[w]; sh[0] = tot; } __syncthreads();
+    float inv = rsqrtf(sh[0] / D + eps);
+    for (int64_t d = t; d < D; d += TB) y[base+d] = (T)((float)ysum[base+d] * inv * (g ? (float)g[d] : 1.f));
 }
-// Fused AddLayerNorm = LayerNorm(x+res)·γ+β, outputs the residual sum
-template <typename T>
+// Fused AddLayerNorm = LayerNorm(x+res)·γ+β, outputs the residual sum. One block per row, coalesced, single-pass
+// Σ and Σ² → mean/var (same scheme as k_gn_fast).
+template <typename T, int TB>
 __global__ void k_add_layernorm(const T *x, const T *res, const T *g, const T *b, T *ysum, T *y, int64_t rows, int64_t D, float eps) {
-    int64_t r = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; if (r >= rows) return;
-    int64_t base = r * D; double mean = 0;
-    for (int64_t d = 0; d < D; ++d) { float t = (float)x[base+d] + (float)res[base+d]; mean += t; ysum[base+d] = (T)t; }
-    mean /= D; double var = 0;
-    for (int64_t d = 0; d < D; ++d) { float t = (float)x[base+d] + (float)res[base+d]; double u = t - mean; var += u * u; }
-    var /= D; float rstd = rsqrtf((float)var + eps);
-    for (int64_t d = 0; d < D; ++d) { float t = (float)x[base+d] + (float)res[base+d];
-        y[base+d] = (T)(((t - (float)mean) * rstd) * (g ? (float)g[d] : 1.f) + (b ? (float)b[d] : 0.f)); }
+    int64_t r = blockIdx.x; if (r >= rows) return;
+    int64_t base = r * D; int t = threadIdx.x;
+    float sum = 0, sq = 0;
+    for (int64_t d = t; d < D; d += TB) { float v = (float)x[base+d] + (float)res[base+d]; ysum[base+d] = (T)v; sum += v; sq += v * v; }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { sum += __shfl_down_sync(0xffffffffu, sum, o); sq += __shfl_down_sync(0xffffffffu, sq, o); }
+    __shared__ float ssum[TB / 32], ssq[TB / 32];
+    if ((t & 31) == 0) { ssum[t >> 5] = sum; ssq[t >> 5] = sq; } __syncthreads();
+    __shared__ float mean, inv;
+    if (t == 0) { float a = 0, q = 0; for (int w = 0; w < TB / 32; w++) { a += ssum[w]; q += ssq[w]; }
+        mean = a / D; float var = q / D - mean * mean; inv = rsqrtf(var + eps); } __syncthreads();
+    for (int64_t d = t; d < D; d += TB)
+        y[base+d] = (T)(((float)ysum[base+d] - mean) * inv * (g ? (float)g[d] : 1.f) + (b ? (float)b[d] : 0.f));
 }
 // SwiGlu/GeGlu: in[...,2D] split in half at the last dim → out[...,D] = act(a)·b (gelu=1 uses GELU, otherwise SiLU)
 template <typename T>
@@ -221,8 +235,8 @@ aclnnStatus aclnnAddRmsNormGetWorkspaceSize(const aclTensor *x, const aclTensor 
     if (ws) *ws = 0; *ex = e; return ACLNN_SUCCESS;
 }
 aclnnStatus aclnnAddRmsNorm(void *, uint64_t, aclOpExecutor *e, aclrtStream s) {
-    int64_t rows = e->outerCount, Dd = e->reduceCount, g = nb(rows); auto st = (cudaStream_t)s;
-    DISP3(( k_add_rmsnorm<T><<<g,TH,0,st>>>((const T*)e->a->data,(const T*)e->b->data,(const T*)D(e->c),(T*)e->out2->data,(T*)e->out->data,rows,Dd,(float)e->eps) ));
+    int64_t rows = e->outerCount, Dd = e->reduceCount; auto st = (cudaStream_t)s;
+    DISP3(( k_add_rmsnorm<T,TH><<<(unsigned)rows,TH,0,st>>>((const T*)e->a->data,(const T*)e->b->data,(const T*)D(e->c),(T*)e->out2->data,(T*)e->out->data,rows,Dd,(float)e->eps) ));
     return finish(e);
 }
 // AddLayerNorm: a=x, b=residual, c=gamma, mask=beta, out=y, out2=residualSum
@@ -236,8 +250,8 @@ aclnnStatus aclnnAddLayerNormGetWorkspaceSize(const aclTensor *x, const aclTenso
     if (ws) *ws = 0; *ex = e; return ACLNN_SUCCESS;
 }
 aclnnStatus aclnnAddLayerNorm(void *, uint64_t, aclOpExecutor *e, aclrtStream s) {
-    int64_t rows = e->outerCount, Dd = e->reduceCount, g = nb(rows); auto st = (cudaStream_t)s;
-    DISP3(( k_add_layernorm<T><<<g,TH,0,st>>>((const T*)e->a->data,(const T*)e->b->data,(const T*)D(e->c),(const T*)D(e->mask),(T*)e->out2->data,(T*)e->out->data,rows,Dd,(float)e->eps) ));
+    int64_t rows = e->outerCount, Dd = e->reduceCount; auto st = (cudaStream_t)s;
+    DISP3(( k_add_layernorm<T,TH><<<(unsigned)rows,TH,0,st>>>((const T*)e->a->data,(const T*)e->b->data,(const T*)D(e->c),(const T*)D(e->mask),(T*)e->out2->data,(T*)e->out->data,rows,Dd,(float)e->eps) ));
     return finish(e);
 }
 // SwiGlu/GeGlu: in[...,2D] → out[...,D]

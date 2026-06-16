@@ -2,9 +2,11 @@
 
 > 中文版 / Chinese: [TODO.zh-CN.md](TODO.zh-CN.md)
 
-**Operator coverage (the former Part A primary goal) is functionally complete on this machine.** Of the **1036** authoritative open-source aclnn level-2 APIs (`cann/{opbase,ops-math,ops-transformer,ops-cv,ops-nn}` at branch `9.1.0-beta.1`, frozen in `tools/official_aclnn.txt`), **1014 (~98%)** are implemented and tolerance-verified locally — against PyTorch (forward + autograd backward), CPU/closed-form references, structural invariants (QR/SVD/eigh reconstruction, RoPE/FFT/cast/MoE round-trips), and a real 2-node RoCE/HCCL path. See `README.md` → "Operator Coverage Baseline" for the summary and the per-family breakdown.
+**Operator coverage (the former Part A primary goal) is functionally complete on this machine.** Of the **1036** authoritative open-source aclnn level-2 APIs (`cann/{opbase,ops-math,ops-transformer,ops-cv,ops-nn}` at branch `9.1.0-beta.1`, frozen in `tools/official_aclnn.txt`), **1014 (~98%)** are implemented and tolerance-verified locally — against PyTorch (forward + autograd backward), CPU/closed-form references, structural invariants (QR/SVD/eigh reconstruction, RoPE/FFT/cast/MoE round-trips), and a real 2-node RoCE/HCCL path. See `README.md` → "Operator Coverage Baseline" for the per-family breakdown.
 
-Everything that could be done and verified on this single GB10 box is done. **What is left below is bound to hardware this machine does not have** — a real Ascend card (for golden cross-checks and bit-exact format fidelity), a high-bandwidth / native-low-precision discrete GPU (for the performance work whose gains GB10's UMA masks), or a multi-card / multi-node cluster (for scaling beyond the verified 2-node baseline).
+**The performance work that needs a high-bandwidth / native-low-precision discrete GPU is now done and measured** on an RTX PRO 6000 Blackwell (`sm_120`, GDDR7, native fp4/fp8) — same-card A/B for every optimization, plus a new native NVFP4 fp4 GEMM path. The numbers and methodology live in [`../BENCHMARK.md`](../BENCHMARK.md) ("Optimization A/B", "Toggle-style optimization sweep", "NVFP4 native fp4 path", "cann-on-gpu vs native CUDA").
+
+**What is left below is bound to hardware this machine does not have** — a real Ascend card (for golden cross-checks and bit-exact format fidelity), or a multi-card / multi-node cluster (for scaling beyond the verified 2-node baseline) — plus one large compute-bound kernel rewrite and a couple of optional structure refactors.
 
 ---
 
@@ -16,40 +18,13 @@ These are about *fidelity against Ascend*, not GPU compute — they need real As
 - **Bit-exact NZ / fractal weight-format fidelity.** The `*WeightNz` matmul family is implemented to *logical* equivalence (NZ weight treated as logically row-major → ND cuBLASLt cores, zero de-swizzle overhead, maximally performant) — **not** bit-level fractal layout reproduction. This is a permanent design limitation on GPU; confirming the fractal fast path matches Ascend's native layout requires real Ascend hardware.
 - **The 22 still-unimplemented ops** (`tools/gap.txt`) — permanent out-of-scope for a GPU numeric reference: framework lifecycle (`aclnnInit`/`aclnnFinalize`), distributed control-plane (`aclnnDistributeBarrier`/`V2`), debug/RAS infrastructure (`aclnnSilentCheck`/`V2`, `aclnnPrecisionCompare`), device codecs (`aclnnHansEncode`/`Decode`), DVPP image-custom ops (`aclnnRasterizer`, `aclnnResize`, `aclnnBackgroundReplace`, `aclnnBlendImagesCustom`, `aclnnMrgbaCustom`), RNG sim-thread (`aclnnSimThreadExponential`), and a few large fused / tensor-list composites with no external reference (`aclnnConfusionTranspose`, `aclnnSplitTensor`, `aclnnAddLora`, `aclnnCoalesceSparse`, `aclnnExpandIntoJaggedPermute`, `aclnnFusedCrossEntropyLossWithMaxSum`, `aclnnFusedLinearOnlineMaxSum`). None have GPU-compute meaning verifiable on this box.
 
-## B. Performance work bound to other hardware
+## B. Remaining performance / scaling work
 
-Current performance data was collected on GB10: unified memory (UMA), low bandwidth (LPDDR5X ~273 GB/s), large L2, single-architecture SASS, single card.
-This hardware profile **masks the gains from memory-bandwidth optimizations** and lacks certain native low-precision hardware units.
-The correctness of the items below is verified or the implementations are ready, but **performance / native paths must be re-benchmarked, tuned, or built from scratch on high-bandwidth discrete GPUs or multi-card setups**.
-Target cards: H100/H200 (`sm_90`), RTX 40 (`sm_89`), B200/GB200 (`sm_100`), RTX 50 (`sm_120`), etc.
+The same-card optimization benchmarking and the native low-precision GEMM builds are **done** (see `../BENCHMARK.md`). What remains:
 
-### Needs Re-benchmarking (Implementation Ready; Gains Masked by GB10)
-
-- **All performance numbers**: Every number in `BENCHMARK.md` is GB10-specific and cannot be extrapolated; a full re-run is required when switching cards.
-- **128-bit vectorized memory access**: Only shows benefit on high-bandwidth (GDDR7/HBM) memory; masked by low bandwidth on GB10.
-- **Operator fusion to reduce memory traffic**: Partially beneficial even on UMA, but the full gain only emerges when high bandwidth and tensor-core saturation coincide.
-- **Native low-precision tensor-core throughput**: The MXFP8 native microscaling path already runs on Blackwell; the native path on each architecture needs its own re-benchmark
-  (Hopper/Ada have no native MX support and will take the functional path).
-- **Speedup of toggle-style optimizations**: TF32 fast-path GEMM, fp8-flash, large-L bitonic sort, native grouped GEMM, conv algorithm autotune (cuDNN find / Winograd), etc. —
-  gains are broadly masked under GB10 UMA and must be re-measured on high-bandwidth / native low-precision cards.
-- **Multi-node communication scalability**: Correctness has only been verified on 2 nodes × 1 card; scalability is unproven. Large-scale ring/tree, non-power-of-2 ranks, and intra-node NVLink all await multi-card/multi-node cluster validation.
-
-### Worth Building New (Only Meaningful or Visible on High-Bandwidth Cards)
-
-1. **Native low-precision GEMM kernel path**: Feed fp4/fp6/MXFP4 directly to tensor-cores instead of the current functional "unpack → fp16 GEMM" path.
-   Delivers real throughput/memory savings, but only meaningful on native fp4/fp8 cards (Blackwell); the functional path is already accurate and the native path serves as an optional fast tier.
-2. **FlashAttention-3-class attention kernel**: The current implementation is a hand-written WMMA flash kernel — solid quality but not FA3 grade. Attention is the primary optimization target in the compute-bound region;
-   rewriting/tuning requires profiling on a high-bandwidth card to be actionable.
-3. **Bandwidth-reducing fusion in production**: Fused QKV projection, residual+norm+next-projection, further attention materialization elimination, etc. — full gains must be quantified on a high-bandwidth card.
-4. **Pervasive 128-bit vectorized memory access**: Improves memory-level parallelism; only effective on high-bandwidth VRAM.
-5. **cann-on-gpu vs. native CUDA comparison benchmark**: On GB10 most scenarios are memory-bound rather than compute-bound, distorting the comparison; benchmarking on a high-bandwidth card is required for credible "compute-intensive gap" numbers.
-6. **Multi-card tensor parallelism / NVLink / multi-node scaling**: TP/PP sharding, intra-node NVLink, and large-scale collective communication all require a multi-card cluster.
-7. **Foreach multi-tensor fusion**: the foreach family (`src/ops/foreach_ext.cu`) currently issues one kernel launch per tensor in the list. Fuse the whole list into a single grid-strided multi-tensor kernel (one launch over a packed tensor-meta array, as in PyTorch's `MultiTensorApply`) to remove per-tensor launch overhead — most visible for optimizer states with many small parameter tensors.
-
-### Fidelity of Native Low-Precision Scaling Formats (Pending Native fp4 Card Validation)
-
-The native NVFP4 path for MXFP4 requires converting Ascend's E8M0/block-32 scaling to E4M3/block-16 scaling: constrained by E4M3's dynamic range and being non-native to the Ascend format,
-this can only serve as an "optional fast, reduced-fidelity" tier and must be validated on a native fp4 card (Blackwell). **Fidelity** computation for Ascend MXFP4 continues to use the functional path (block dequantize → fp16, full E8M0 range, exact).
+- **FlashAttention-3-grade attention kernel.** The current flash attention is a hand-written WMMA kernel (`k_flash_wmma`, 1 warp/block, legacy `wmma::` 16×16×16); profiling (`nsys`) confirms it dominates flash-path time, and when S/P materialization fits memory the cuBLASLt batched perf-path is already ~3× faster and is the default (flash stays the memory-frugal path for large-S / causal). A true FA3-grade kernel — warp-specialized producer/consumer, `cp.async`/TMA, ping-pong double-buffering, tcgen05 — is a large effort and needs **Nsight Compute** (occupancy / stall metrics) to tune; only `nsys` is installed here. Note also that on this card cuBLASLt currently selects `cutlass_80_tensorop` (Ampere) kernels for the batched attention GEMMs — a cuBLASLt-version tuning gap worth revisiting on a newer cuBLAS.
+- **Bandwidth-reducing production fusions — remaining ops.** Residual+norm (`AddRmsNorm`/`AddLayerNorm`) is built, fixed, and quantified (see BENCHMARK). Still open: a fused QKV projection and further attention-materialization elimination (new fused ops).
+- **Multi-card / multi-node scaling.** Collective correctness is verified only on 2 nodes × 1 card. Large-scale ring/tree, non-power-of-2 ranks, tensor/pipeline-parallel sharding, and intra-node NVLink all require a multi-card cluster.
 
 ## C. Possible future structure work (optional, not hardware-bound)
 

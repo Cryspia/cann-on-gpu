@@ -84,6 +84,30 @@ __global__ void k_swizzle_scale(const uint8_t *in, uint8_t *out, int rows, int n
 }
 inline int64_t swizzle_bytes(int rows, int nb) { return ru(rows, 128) * ru(nb, 4); }
 
+// ---- NVFP4 scale conversion: Ascend MXFP4 uses E8M0 (pure exponent, bias 127) per block of 32; Blackwell's
+// native fp4 tensor core (cuBLASLt VEC16_UE4M3) wants an E4M3 scale per block of 16. Each block-32 maps to
+// two child block-16s with the SAME scale, so the dequantized values are identical to the functional path —
+// EXCEPT where the exponent leaves E4M3's representable power-of-2 range [2^-6, 2^8], which is clamped
+// (the documented "reduced-fidelity fast tier"). E4M3: bias 7, exp_field∈[1,15], mantissa 0 → 2^exp.
+__device__ inline uint8_t e8m0_to_e4m3_pow2(uint8_t e8) {
+    int ex = (int)e8 - 127;
+    if (ex < -6) ex = -6;
+    if (ex > 8)  ex = 8;
+    return (uint8_t)(((ex + 7) & 0xF) << 3);
+}
+// scaleA[M,nb32] (block = last dim) → E4M3[M,nb16=2*nb32], each block-32 duplicated to its two block-16s
+__global__ void k_e8m0_to_e4m3_A(const uint8_t *in, uint8_t *out, int rows, int nb32) {
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; if (tid >= (int64_t)rows * nb32) return;
+    int r = tid / nb32, b = tid % nb32, nb16 = nb32 * 2; uint8_t v = e8m0_to_e4m3_pow2(in[tid]);
+    out[(int64_t)r * nb16 + 2 * b] = v; out[(int64_t)r * nb16 + 2 * b + 1] = v;
+}
+// scaleB[nb32,N] (block = first dim) → E4M3[nb16,N]
+__global__ void k_e8m0_to_e4m3_B(const uint8_t *in, uint8_t *out, int nb32, int N) {
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; if (tid >= (int64_t)nb32 * N) return;
+    int b = tid / N, j = tid % N; uint8_t v = e8m0_to_e4m3_pow2(in[tid]);
+    out[(int64_t)(2 * b) * N + j] = v; out[(int64_t)(2 * b + 1) * N + j] = v;
+}
+
 // Unpack fp4 (2 elements/byte) / fp6 (1 byte/element) to fp16 (indexed by flat logical index)
 __global__ void deq_fp4_to_half(const uint8_t *p, __half *o, int64_t n, int k) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -572,6 +596,60 @@ aclnnStatus aclnnMatmulMxFp8Hw(void *ws, uint64_t wsSize, aclOpExecutor *e, aclr
     return st == CUBLAS_STATUS_SUCCESS ? ACLNN_SUCCESS : ACLNN_ERR_RUNTIME_ERROR;
 }
 
+// ---- NVFP4 native fp4 tensor-core path (cuBLASLt VEC16_UE4M3, block-16) ----
+//   This cuBLASLt only accepts NVFP4 (VEC16_UE4M3) for fp4 — not MXFP4 (VEC32_UE8M0) — so to actually hit the
+//   native fp4 tensor cores we convert Ascend's E8M0/block-32 scales to E4M3/block-16 (each block-32 → two
+//   block-16 with the same 2^exp value: dequant values identical except where the exponent leaves E4M3's
+//   [2^-6,2^8] range, then clamped). Opt-in via NVFP4_HW=1; falls back to the functional path if cuBLASLt
+//   declines. The exact-range functional path (full E8M0) remains the fidelity reference.
+static aclnnStatus nvfp4_hw(void *ws, uint64_t wsSize, aclOpExecutor *e, aclrtStream stream) {
+    auto s = (cudaStream_t)stream;
+    const int64_t M = e->m, N = e->n, K = e->k, nb16 = K / 16; const int nb32 = (int)(K / MX_BLK);
+    int64_t saBytes = swizzle_bytes((int)M, (int)nb16), sbBytes = swizzle_bytes((int)N, (int)nb16);
+    uint8_t *Bt = (uint8_t *)ws;                       // [N,K] fp4 packed = N*K/2 bytes
+    uint8_t *cA = Bt + (size_t)N * K / 2;              // converted E4M3 scaleA [M,nb16]
+    uint8_t *cB = cA + (size_t)M * nb16;               // converted E4M3 scaleB [nb16,N]
+    uint8_t *sAsw = cB + (size_t)nb16 * N;             // swizzled selfScale (rows=M)
+    uint8_t *sBsw = sAsw + saBytes;                    // swizzled otherScale (rows=N)
+    void *ltWs = sBsw + sbBytes; size_t ltSize = wsSize - (size_t)((char *)ltWs - (char *)ws);
+    transpose_fp4<<<dim3((unsigned)((K/2+15)/16), (unsigned)((N+15)/16)), dim3(16,16), 0, s>>>((const uint8_t *)e->b->data, Bt, K, N);
+    k_e8m0_to_e4m3_A<<<(unsigned)((M*nb32+255)/256), 256, 0, s>>>((const uint8_t *)e->c->data, cA, (int)M, nb32);
+    k_e8m0_to_e4m3_B<<<(unsigned)((nb32*N+255)/256), 256, 0, s>>>((const uint8_t *)e->mask->data, cB, nb32, (int)N);
+    cudaMemsetAsync(sAsw, 0, saBytes, s); cudaMemsetAsync(sBsw, 0, sbBytes, s);
+    int gm = (int)((M*nb16 + 255) / 256), gn = (int)((N*nb16 + 255) / 256);
+    k_swizzle_scale<<<gm, 256, 0, s>>>(cA, sAsw, (int)M, (int)nb16, 0);
+    k_swizzle_scale<<<gn, 256, 0, s>>>(cB, sBsw, (int)N, (int)nb16, 1);
+    cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la, lb, lc;
+    cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasOperation_t T = CUBLAS_OP_T, No = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof(T));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &No, sizeof(No));
+    int32_t mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode));
+    void *aScale = sBsw, *bScale = sAsw;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &aScale, sizeof(aScale));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &bScale, sizeof(bScale));
+    cublasLtMatrixLayoutCreate(&la, CUDA_R_4F_E2M1, K, N, K);
+    cublasLtMatrixLayoutCreate(&lb, CUDA_R_4F_E2M1, K, M, K);
+    cublasLtMatrixLayoutCreate(&lc, e->out->dtype == ACL_FLOAT ? CUDA_R_32F : CUDA_R_16F, N, M, N);
+    const float alpha = 1.f, beta = 0.f;
+    cublasLtMatmulPreference_t pref; cublasLtMatmulPreferenceCreate(&pref);
+    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ltSize, sizeof(ltSize));
+    cublasLtMatmulHeuristicResult_t heur{}; int nres = 0;
+    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt_handle(), op, la, lb, lc, lc, pref, 1, &heur, &nres);
+    cublasLtMatmulPreferenceDestroy(pref);
+    cublasStatus_t st = (hs == CUBLAS_STATUS_SUCCESS && nres > 0)
+        ? cublasLtMatmul(lt_handle(), op, &alpha, Bt, la, e->a->data, lb, &beta, e->out->data, lc, e->out->data, lc, &heur.algo, ltWs, ltSize, s)
+        : CUBLAS_STATUS_NOT_SUPPORTED;
+    cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc); cublasLtMatmulDescDestroy(op);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        if (getenv("MXFP4_DBG")) fprintf(stderr, "[nvfp4] native fp4 declined (hs=%d nres=%d st=%d) → functional\n", (int)hs, nres, (int)st);
+        return aclnnMatmulMxFp4(ws, wsSize, e, stream);
+    }
+    delete e; return ACLNN_SUCCESS;
+}
+
 // ---- MXFP4 hardware tensor-core path: cuBLASLt native fp4 (CUDA_R_4F_E2M1) + VEC32_UE8M0 block scaling ----
 //   Ascend Float4E2M1 decodes identically to OCP standard E2M1 (verified), so the native path is lossless.
 //   Structure mirrors MXFP8 Hw, with elements changed to fp4 (2 elements/byte packed).
@@ -594,12 +672,17 @@ aclnnStatus aclnnMatmulMxFp4HwGetWorkspaceSize(const aclTensor *self, const aclT
     if (!mx_use_hw()) { e->keepDim = true; *ws = fnc; }
     else { e->keepDim = false;                                            // Blackwell: try native path; reserve space for functional fallback
         uint64_t nat = (uint64_t)(n * k / 2) + (uint64_t)swizzle_bytes((int)m, (int)nb) + (uint64_t)swizzle_bytes((int)n, (int)nb) + LT_WS;
-        *ws = nat > fnc ? nat : fnc; }
+        // NVFP4 path (VEC16_UE4M3, block-16) needs Bt + converted E4M3 scales [M,nb16]+[nb16,N] + their swizzled buffers
+        int64_t nb16 = k / 16;
+        uint64_t nv = (uint64_t)(n * k / 2) + (uint64_t)m * nb16 + (uint64_t)nb16 * n
+                    + (uint64_t)swizzle_bytes((int)m, (int)nb16) + (uint64_t)swizzle_bytes((int)n, (int)nb16) + LT_WS;
+        uint64_t mx = nat > fnc ? nat : fnc; *ws = nv > mx ? nv : mx; }
     *ex = e; return ACLNN_SUCCESS;
 }
 aclnnStatus aclnnMatmulMxFp4Hw(void *ws, uint64_t wsSize, aclOpExecutor *e, aclrtStream stream) {
     if (!e) return ACLNN_ERR_PARAM_INVALID;
     if (e->keepDim) return aclnnMatmulMxFp4(ws, wsSize, e, stream);     // non-Blackwell fallback to functional path (deletes e)
+    if (getenv("NVFP4_HW")) return nvfp4_hw(ws, wsSize, e, stream);     // native fp4 via NVFP4 (VEC16_UE4M3) scale conversion
     auto s = (cudaStream_t)stream;
     const int64_t M = e->m, N = e->n, K = e->k, nb = K / MX_BLK;
     int64_t saBytes = swizzle_bytes((int)M, (int)nb), sbBytes = swizzle_bytes((int)N, (int)nb);

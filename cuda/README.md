@@ -64,6 +64,7 @@ This is not a performance compromise — it is the **necessary approach for Asce
 The data must first be decoded according to Ascend semantics (boundary tables) before computation; feeding NVIDIA's native fp4/fp8 tensor cores directly would produce NVIDIA numerical results, validating the wrong target.
 Low-precision codec golden values are generated offline from the CANN reference codec and verified with pure bitwise operations.
 The Blackwell MXFP8 native microscaling path (`aclnnMatmulMxFp8Hw`, VEC32_UE8M0 + 128×4 super-tile swizzle) is implemented and automatically falls back to the functional path at run time on non-Blackwell architectures.
+An **optional native NVFP4 fp4 path** (`NVFP4_HW=1`) converts Ascend's E8M0/block-32 scale to E4M3/block-16 on the fly to reach Blackwell's fp4 tensor cores (`VEC16_UE4M3`) — measured at **3.0× the functional path** (see `../BENCHMARK.md`). It is exact while each block's scale exponent stays in E4M3's range [2⁻⁶, 2⁸] and clamps outside, so it is an opt-in fast/reduced-fidelity tier; the functional decode→fp16 path remains the default and the fidelity reference.
 
 ---
 
@@ -77,11 +78,12 @@ All optimizations keep tolerance-based comparison tests fully passing and retain
 - **Caching device-memory allocator**: `aclrtMalloc/Free` uses bucketed reuse; a single malloc+free round-trip drops from hundreds of µs (direct cudaMalloc) to sub-µs — the foundation of the inference backend.
 - **PagedAttention warp-per-row**: register array `acc[D/32]` replaces local-memory `acc[256]` + coalesced KV access, achieving ~bandwidth-bound throughput.
 - **Weight-quantized small-M fused GEMM**: W8A16/W4A16 at small M (decode/small batch) reads int8/int4 weights directly into a fused GEMM without materializing fp16, saving 4×/8× weight bandwidth; large M (prefill) still dequantizes + cuBLASLt tensor-core.
-- **Coalesced-access normalization**: RMSNorm/Softmax/GroupNorm changed from "one thread per row" to "one block per row + warp reduction" for coalesced memory access.
+- **Coalesced-access normalization**: RMSNorm/Softmax/GroupNorm — and the fused `AddRmsNorm`/`AddLayerNorm` (residual-add + norm, used by MoE/fused-matmul/mc2) — use "one block per row + warp reduction" for coalesced access. (The fused add-norm kernels had regressed to a naive one-thread-per-row form ~100× slower than standalone RMSNorm; now fixed, see `../BENCHMARK.md`.)
+- **Foreach multi-tensor fusion**: the arithmetic `aclnnForeach*` family fuses the whole tensor list into a single grid-strided kernel (per-tensor metadata staged in the caller workspace, `grid.y` = tensor index, à la PyTorch `MultiTensorApply`) instead of one launch per tensor — **43–70×** on optimizer-state-style lists of many small tensors (`FOREACH_NO_FUSE=1` reverts).
 - **W8A8 native int8 GEMM**: cuBLASLt `CUDA_R_8I` + int32 accumulation + per-channel scale epilogue; falls back to fp16 on failure.
 - **MoE grouped GEMM**: variable-length groups overlapped across multiple streams, or native grouped GEMM (switchable).
 - **CUDA Graph**: single-token decode steps captured into a graph and replayed in a full loop, eliminating per-kernel launch overhead (decode is launch-bound).
-- **128-bit vectorized memory access**: elementwise 16B vectorized fast path + scalar fallback (benefits mainly on high-bandwidth discrete GPUs, see `TODO.md`).
+- **128-bit vectorized memory access**: elementwise 16B vectorized fast path + scalar fallback (`ELTWISE_NO_VEC=1` reverts). Same-card win is regime-dependent — 1.5–3× when L2-resident, a wash once DRAM-bandwidth-bound (see `../BENCHMARK.md`).
 
 ---
 
