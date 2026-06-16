@@ -1,0 +1,24 @@
+==== cann-on-gpu 性能基准（wall-clock/调用，含执行器构建）====
+GEMM fp16 1024x1024x1024             0.0322 ms    66728.0 GFLOP/s
+GEMM fp16 4096x4096x4096             1.4655 ms    93780.6 GFLOP/s
+GEMM bf16 1024x1024x1024             0.0317 ms    67681.9 GFLOP/s
+GEMM bf16 4096x4096x4096             1.4663 ms    93729.9 GFLOP/s
+---- attention（fp16，flash 在线softmax免物化 vs perf cuBLASLt 批量）----
+Attn flash B4N8S128D64               0.1121 ms     1197.5 GFLOP/s
+Attn perf  B4N8S128D64               0.0636 ms     2110.9 GFLOP/s
+Attn flash B4N8S512D64               1.3902 ms     1544.7 GFLOP/s
+Attn perf  B4N8S512D64               0.6739 ms     3186.5 GFLOP/s
+Attn flash B4N8S1024D64              5.0835 ms     1689.8 GFLOP/s
+Attn perf  B4N8S1024D64              3.0122 ms     2851.8 GFLOP/s
+Attn flash B4N8S2048D64             20.8663 ms     1646.7 GFLOP/s
+Attn perf  B4N8S2048D64             11.9999 ms     2863.3 GFLOP/s
+---- PagedAttention 解码（fp16，B64 N8 D64，scalar 旧版 vs warp 优化）----
+Paged scalar B64N8L1024D64          13.8611 ms        9.7 GFLOP/s
+Paged warp   B64N8L1024D64           1.1052 ms      121.4 GFLOP/s
+Paged scalar B64N8L4096D64          55.4824 ms        9.7 GFLOP/s
+Paged warp   B64N8L4096D64           4.3933 ms      122.2 GFLOP/s
+---- 访存型 ----
+Add n=4M                             0.2034 ms      247.4 GB/s
+ReduceSum n=4M                       0.0574 ms      292.2 GB/s
+RMSNorm 4096x1024                    0.1085 ms      309.3 GB/s
+Softmax 4096x1024                    0.1037 ms      323.6 GB/s
