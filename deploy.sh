@@ -387,8 +387,10 @@ resolve_cann_run() {
 
 # Extract headers from a .run archive: outer --noexec --extract, then --tar x on inner component packages
 #   cann-npu-runtime -> aarch64-linux/include/{acl,version}
-#   cann-opbase      -> ops_base/include/aclnnop
+#   cann-opbase      -> ops_base/include/{aclnnop, nnopbase/aclnn}   (aclnn meta-contract is nested under nnopbase/)
 #   cann-hcomm       -> hcomm/include/hccl   (HCCL type + control-plane headers)
+#   cann-ge-executor -> ge-executor/include/acl  (acl_base_mdl.h / acl_op.h — pulled in transitively by acl/acl.h)
+#   cann-ge-compiler -> ge-compiler/include/acl  (acl_op_compiler.h — pulled in by the backend)
 extract_acl_from_run() {
     local inc="$1"
     local run; run="$(resolve_cann_run)" || die "No usable CANN .run archive available"
@@ -396,17 +398,28 @@ extract_acl_from_run() {
     log "Extracting headers from .run archive: $run"
     local tmp ex; tmp="$(mktemp -d)"; ex="$(mktemp -d)"
     bash "$run" --noexec --extract="$tmp" >/dev/null 2>&1 || { rm -rf "$tmp" "$ex"; die "Failed to extract .run archive"; }
-    local rp="$tmp/run_package" rt op hc
+    local rp="$tmp/run_package" rt op hc gee gec
     rt="$(ls "$rp"/cann-npu-runtime_*.run 2>/dev/null | head -1)"
     op="$(ls "$rp"/cann-opbase_*.run 2>/dev/null | head -1)"
     hc="$(ls "$rp"/cann-hcomm_*.run 2>/dev/null | head -1)"
+    gee="$(ls "$rp"/cann-ge-executor_*.run 2>/dev/null | head -1)"
+    gec="$(ls "$rp"/cann-ge-compiler_*.run 2>/dev/null | head -1)"
     [ -n "$rt" ] && ( cd "$ex" && bash "$rt" --tar x ./aarch64-linux/include >/dev/null 2>&1 ) || warn "  cann-npu-runtime not found; acl/ headers may be missing"
     [ -n "$op" ] && ( cd "$ex" && bash "$op" --tar x ./ops_base/include >/dev/null 2>&1 ) || warn "  cann-opbase not found; aclnnop/ headers may be missing"
     [ -n "$hc" ] && ( cd "$ex" && bash "$hc" --tar x ./hcomm/include >/dev/null 2>&1 ) || warn "  cann-hcomm not found; hccl/ headers may be missing"
+    # acl/acl.h transitively #includes acl_base_mdl.h + acl_op.h (cann-ge-executor) and acl_op_compiler.h (cann-ge-compiler).
+    [ -n "$gee" ] && ( cd "$ex" && bash "$gee" --tar x ./ge-executor/include/acl >/dev/null 2>&1 ) || warn "  cann-ge-executor not found; acl_base_mdl.h/acl_op.h may be missing"
+    [ -n "$gec" ] && ( cd "$ex" && bash "$gec" --tar x ./ge-compiler/include/acl >/dev/null 2>&1 ) || warn "  cann-ge-compiler not found; acl_op_compiler.h may be missing"
     local r
-    for r in "$ex/aarch64-linux/include" "$ex/ops_base/include" "$ex/hcomm/include"; do
+    for r in "$ex/aarch64-linux/include" "$ex/ops_base/include" "$ex/hcomm/include" \
+             "$ex/ge-executor/include" "$ex/ge-compiler/include"; do
         [ -d "$r" ] && copy_acl_subdirs "$r" "$inc"
     done
+    # CANN 9.1 ships the aclnn meta-contract (acl_meta.h / aclnn_base.h) under ops_base/include/nnopbase/aclnn/,
+    # not a top-level aclnn/ — copy it explicitly so $inc/aclnn/acl_meta.h (required by the build) exists.
+    if [ -d "$ex/ops_base/include/nnopbase/aclnn" ]; then
+        mkdir -p "$inc/aclnn"; cp -r "$ex/ops_base/include/nnopbase/aclnn/." "$inc/aclnn/" 2>/dev/null || true
+    fi
     rm -rf "$tmp" "$ex"
 }
 
