@@ -241,6 +241,14 @@ install_build_tools() {
     log "pip: install numpy / pytest / pybind11 / cuda-python"
     pip install --no-input numpy pytest pybind11 cuda-python \
         || warn "Some Python dependencies failed to install (does not affect C++/CUDA build itself)"
+
+    #     torch — independent PyTorch reference oracle for tools/torch_golden.sh, the default
+    #             verification path. The oracles only do CPU float64 math, so the CUDA build is
+    #             irrelevant: prefer the wheel matching the card's CUDA major, fall back to the CPU wheel.
+    log "pip: install torch (PyTorch reference oracle for torch_golden.sh)"
+    pip install --no-input --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}0" torch \
+        || pip install --no-input --index-url https://download.pytorch.org/whl/cpu torch \
+        || warn "PyTorch oracle failed to install (torch_golden.sh will skip; other verification unaffected)"
 }
 
 # ----------------------------------------------------------------------------

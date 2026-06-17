@@ -7,11 +7,8 @@
 #   indexcopy    = index_copy_(0, idx1d, src)
 #   indexfill    = index_fill_(0, idx1d, value)
 #   scattervalue = scatter_(dim, indexNd, value)  (full-shape index, real dim)
-import sys, numpy as np, torch
+from torch_common import *
 op, pre = sys.argv[1], sys.argv[2]
-def Lf(name, n, shape): return torch.from_numpy(np.fromfile(pre+name,dtype=np.float32).astype(np.float64)).reshape(shape)
-def Li(name, shape):    return torch.from_numpy(np.fromfile(pre+name,dtype=np.int64)).reshape(shape)
-def save(name, t): t.detach().numpy().astype(np.float32).tofile(pre+name)
 
 SV,SROW,SL = 6,4,5                  # dim0 ops: self[SV,SROW], idx[SL], src[SL,SROW]
 FV,FROW,FL = 6,4,3                  # indexfill: self[FV,FROW], idx[FL]
@@ -19,21 +16,21 @@ VR,VC,VK   = 4,6,3                  # scattervalue: self[VR,VC], idx[VR,VK], dim
 ALPHA, FILLV, SVALUE = 2.0, 3.14, 2.71
 
 if op in ("indexput","indexputadd"):     # IndexPutImpl: 1-D index on dim0, in-place replace/accumulate
-    self=Lf(".self",SV*SROW,(SV,SROW)).clone(); vals=Lf(".src",SL*SROW,(SL,SROW)); idx=Li(".idx",(SL,))
-    self.index_put_((idx,), vals, accumulate=(op=="indexputadd")); save(".out",self)
+    self=loadf(pre,".self",(SV,SROW)).clone(); vals=loadf(pre,".src",(SL,SROW)); idx=loadi(pre,".idx",(SL,))
+    self.index_put_((idx,), vals, accumulate=(op=="indexputadd")); savef(pre,".out",self)
 elif op in ("scatter","scatteradd","indexadd","indexcopy"):
-    self=Lf(".self",SV*SROW,(SV,SROW)); src=Lf(".src",SL*SROW,(SL,SROW)); idx=Li(".idx",(SL,))
+    self=loadf(pre,".self",(SV,SROW)); src=loadf(pre,".src",(SL,SROW)); idx=loadi(pre,".idx",(SL,))
     out=self.clone()
     if   op=="scatter":   out.index_copy_(0,idx,src)
     elif op=="indexcopy": out.index_copy_(0,idx,src)
     elif op=="scatteradd":out.index_add_(0,idx,src)
     else:                 out.index_add_(0,idx,ALPHA*src)
-    save(".out",out)
+    savef(pre,".out",out)
 elif op=="indexfill":
-    self=Lf(".self",FV*FROW,(FV,FROW)); idx=Li(".idx",(FL,))
-    out=self.clone().index_fill_(0,idx,FILLV); save(".out",out)
+    self=loadf(pre,".self",(FV,FROW)); idx=loadi(pre,".idx",(FL,))
+    out=self.clone().index_fill_(0,idx,FILLV); savef(pre,".out",out)
 elif op=="scattervalue":
-    self=Lf(".self",VR*VC,(VR,VC)); idx=Li(".idx",(VR,VK))
-    out=self.clone().scatter_(1,idx,SVALUE); save(".out",out)
+    self=loadf(pre,".self",(VR,VC)); idx=loadi(pre,".idx",(VR,VK))
+    out=self.clone().scatter_(1,idx,SVALUE); savef(pre,".out",out)
 else:
-    sys.stderr.write("torch_grad4: no ref for %s\n"%op); sys.exit(2)
+    no_ref("torch_scatter", op)

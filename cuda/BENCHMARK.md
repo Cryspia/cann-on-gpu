@@ -32,10 +32,10 @@ Turnaround is dominated by "build + instruction-level simulation" and grows with
 
 ```bash
 source env.sh
-cd tools
+cd tools && mkdir -p bin
 g++ -std=c++17 -O2 -I"$ACL_INCLUDE" -I../include bench.cpp \
-    -L../cuda/lib -lascendcl -Wl,-rpath,../cuda/lib -o bench
-./bench
+    -L../cuda/lib -lascendcl -Wl,-rpath,../cuda/lib -o bin/bench
+./bin/bench
 ```
 
 - decode-loop CUDA Graph latency: `tools/decode_graph/build_decode_graph.sh`.

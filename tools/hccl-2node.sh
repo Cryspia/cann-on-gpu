@@ -8,7 +8,7 @@ IFACE="${NCCL_SOCKET_IFNAME:-eth0}"
 HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1}"
 GID="${NCCL_IB_GID_INDEX:-3}"
 ID=/tmp/hccl_root.bin
-BIN=./hccl_allreduce
+BIN=bin/hccl_allreduce
 SHIM=../cuda/lib
 
 [ -n "${NCCL_DIR:-}" ] || source ../env.sh

@@ -2,11 +2,11 @@
 # PyTorch-autograd reference for activation backward ops. Reads <prefix>.x (forward input) and
 # <prefix>.go (upstream gradient), runs y=f(x); y.backward(go), writes x.grad as the reference
 # gradInput (raw fp32) to <ref.bin>. Autograd is independent of our hand-derived analytic f'.
-import sys, numpy as np, torch, torch.nn.functional as F
+from torch_common import *
 
 op, prefix, out = sys.argv[1], sys.argv[2], sys.argv[3]
-x  = torch.from_numpy(np.fromfile(prefix + ".x",  dtype=np.float32).astype(np.float64)).requires_grad_(True)
-go = torch.from_numpy(np.fromfile(prefix + ".go", dtype=np.float32).astype(np.float64))
+x  = loadf(prefix, ".x").requires_grad_(True)
+go = loadf(prefix, ".go")
 
 F_ = {
     "relu":       lambda t: torch.relu(t),
@@ -22,7 +22,7 @@ F_ = {
     "mish":       lambda t: F.mish(t),
     "selu":       lambda t: F.selu(t),
 }
-if op not in F_: sys.stderr.write("torch_grad: no forward for %s\n" % op); sys.exit(2)
+if op not in F_: no_ref("torch_actgrad", op)
 y = F_[op](x)
 y.backward(go)
-x.grad.numpy().astype(np.float32).tofile(out)
+savef("", out, x.grad)

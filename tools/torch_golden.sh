@@ -13,7 +13,8 @@ set -uo pipefail
 cd "$(dirname "$0")"
 source ../env.sh 2>/dev/null || true
 PY="${PY:-$HOME/miniforge3/envs/cann-gpu/bin/python}"
-BIN=./cannsim_golden_check
+mkdir -p bin
+BIN=bin/cannsim_golden_check
 TMP="${TMPDIR:-/tmp}/torch_golden"; mkdir -p "$TMP"
 
 OPS=("$@")

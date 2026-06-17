@@ -5,17 +5,15 @@ third_party/
 *.o
 *.so
 env.sh
+__pycache__/
+*.pyc
 
-# Compiled tool/check binaries (built from the sibling .cpp; not source)
-tools/*_check
-tools/grad_check*
-tools/invar[0-9]*
-tools/bench
-tools/graph_demo
-tools/hccl_allreduce
-tools/hccl_collectives
-tools/mc2_2node
-tools/hifloat4_gen
+# Compiled tool/check binaries land in a per-directory bin/ folder so new tools need no
+# per-binary .gitignore entry (the build scripts -o into bin/; only the .cpp/.cu/.sh are source).
+tools/bin/
+cuda/tools/bin/
+
+# Subdir tools whose binary sits next to its own data/ (run cwd-relative), kept in place:
 tools/decode_graph/decode_graph
 tools/qwen3/run_qwen3
 tools/qwen35/run_gdn
@@ -25,7 +23,3 @@ tools/qwen35/run_qwen35
 tools/qwen3/data/
 tools/qwen35/data_full/
 tools/qwen35/data_gdn/
-
-# Compiled CUDA-tool demos (built from sibling .cu/.cpp via the build_*.sh scripts)
-cuda/tools/nccl_allreduce
-cuda/tools/ptx_module_demo

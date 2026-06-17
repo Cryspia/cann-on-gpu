@@ -10,7 +10,7 @@ IFACE="${NCCL_SOCKET_IFNAME:-eth0}"
 HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1}"   # list both RoCE NICs → aggregate bandwidth
 GID="${NCCL_IB_GID_INDEX:-3}"
 ID=/tmp/mc2_root.bin
-BIN=./mc2_2node
+BIN=bin/mc2_2node
 SHIM=../cuda/lib
 
 [ -n "${NCCL_DIR:-}" ] || source ../env.sh

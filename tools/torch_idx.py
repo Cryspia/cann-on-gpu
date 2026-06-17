@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # PyTorch refs for indexing/shape extras. int outputs saved as float.
-import sys, numpy as np, torch
+from torch_common import *
 op, pre = sys.argv[1], sys.argv[2]
-def Lf(name,shape): return torch.from_numpy(np.fromfile(pre+name,dtype=np.float32).astype(np.float64)).reshape(shape)
-def Li(name,shape): return torch.from_numpy(np.fromfile(pre+name,dtype=np.int64)).reshape(shape)
-def Lii(name,shape): return torch.from_numpy(np.fromfile(pre+name,dtype=np.int32).astype(np.int64)).reshape(shape)
-def save(t): np.atleast_1d(np.asarray(t.detach().numpy(),dtype=np.float64).astype(np.float32).reshape(-1)).tofile(pre+".out")
+def Lf(name,shape): return loadf(pre, name, shape)
+def Li(name,shape): return loadi(pre, name, shape)
+def Lii(name,shape): return loadi32(pre, name, shape)
+def save(t): savef(pre, ".out", t)
 if   op=="take":        save(torch.take(Lf(".a",(3,4)),Li(".idx",(5,))))
 elif op=="takealongdim":save(torch.take_along_dim(Lf(".a",(3,4)),Li(".idx",(3,4)),dim=1))
 elif op=="indexselect": save(torch.index_select(Lf(".a",(4,5)),0,Li(".idx",(3,))))
@@ -18,4 +18,4 @@ elif op=="diagonal":    save(torch.diagonal(Lf(".a",(4,4)),0))
 elif op=="tile":        save(torch.tile(Lf(".a",(2,3)),(2,2)))
 elif op=="repeat":      save(Lf(".a",(2,3)).repeat(2,2))
 elif op=="repeatinterleave": save(torch.repeat_interleave(Lf(".a",(3,4)),2,dim=1))
-else: sys.stderr.write("torch_idx: no ref %s\n"%op); sys.exit(2)
+else: no_ref("torch_idx", op)

@@ -10,7 +10,7 @@ HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1}"
 GID="${NCCL_IB_GID_INDEX:-3}"
 RT=/tmp/hccl_ranktable.json
 ID=/tmp/hccl_cluster_root.bin
-BIN=./hccl_collectives
+BIN=bin/hccl_collectives
 SHIM=../cuda/lib
 
 [ -n "${NCCL_DIR:-}" ] || source ../env.sh

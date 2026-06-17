@@ -4,12 +4,11 @@
 # and writes the reference output as raw fp32 to <golden.bin> — so cannsim_golden_check's `check`
 # can compare the shim against PyTorch. PyTorch is implementation-independent from our shim, so this
 # catches "buggy-vs-buggy" cases where a hand-written CPU test reference shares the shim's mistake.
-import sys, numpy as np, torch
+from torch_common import *
 
 op, prefix, out = sys.argv[1], sys.argv[2], sys.argv[3]
-x = torch.from_numpy(np.fromfile(prefix + ".x", dtype=np.float32).astype(np.float64))
-def y():
-    return torch.from_numpy(np.fromfile(prefix + ".y", dtype=np.float32).astype(np.float64))
+x = loadf(prefix, ".x")
+def y(): return loadf(prefix, ".y")
 
 UN = {
     "relu": lambda: torch.relu(x), "exp": lambda: torch.exp(x), "sqrt": lambda: torch.sqrt(x),
@@ -36,7 +35,7 @@ BIN = {
     "fmod": lambda: torch.fmod(x, y()), "atan2": lambda: torch.atan2(x, y()),
     "xlogy": lambda: torch.xlogy(x, y()),
 }
-if op in UN:   r = UN[op]()
+if op in UN:    r = UN[op]()
 elif op in BIN: r = BIN[op]()
-else: sys.stderr.write("torch_oracle: no reference for op %s\n" % op); sys.exit(2)
-r.numpy().astype(np.float32).tofile(out)
+else: no_ref("torch_oracle", op)
+savef("", out, r)

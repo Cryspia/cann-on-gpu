@@ -2,11 +2,10 @@
 # PyTorch references for reduction / softmax FORWARD ops (reduce along dim=1 of x[Rr,Cc]).
 # Conventions verified from the shim: Var/Std unbiased (correction=1); Amax/Amin plain max/min;
 # Norm = (sum |x|^p)^(1/p). argmax/argmin/median outputs compared as float.
-import sys, numpy as np, torch
+from torch_common import *
 op, pre = sys.argv[1], sys.argv[2]
 Rr,Cc,P = 6,5,2.0
-x = torch.from_numpy(np.fromfile(pre+".x",dtype=np.float32).astype(np.float64)).reshape(Rr,Cc)
-def save(name,t): t.detach().numpy().astype(np.float32).tofile(pre+name)
+x = loadf(pre, ".x", (Rr,Cc))
 ref = {
   "softmax":    lambda: torch.softmax(x,1),
   "logsoftmax": lambda: torch.log_softmax(x,1),
@@ -22,5 +21,5 @@ ref = {
   "argmin":     lambda: torch.argmin(x,1).double(),
   "median":     lambda: torch.median(x,1).values,
 }
-if op not in ref: sys.stderr.write("torch_grad6: no ref for %s\n"%op); sys.exit(2)
-save(".out", ref[op]())
+if op not in ref: no_ref("torch_reduce", op)
+savef(pre, ".out", ref[op]())

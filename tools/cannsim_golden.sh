@@ -25,7 +25,8 @@ if [ ! -d "$EXPLORER" ]; then
     echo "      To run cannsim anyway: git clone https://github.com/Cryspia/cann-api-explorer.git <dir> && EXPLORER_DIR=<dir> $0" >&2
     exit 1
 fi
-BIN=./cannsim_golden_check
+mkdir -p bin
+BIN=bin/cannsim_golden_check
 JOBS="${JOBS:-1}"
 TMP="${TMPDIR:-/tmp}/cannsim_golden"; mkdir -p "$TMP"
 
