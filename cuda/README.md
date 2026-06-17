@@ -64,13 +64,13 @@ This is not a performance compromise — it is the **necessary approach for Asce
 The data must first be decoded according to Ascend semantics (boundary tables) before computation; feeding NVIDIA's native fp4/fp8 tensor cores directly would produce NVIDIA numerical results, validating the wrong target.
 Low-precision codec golden values are generated offline from the CANN reference codec and verified with pure bitwise operations.
 The Blackwell MXFP8 native microscaling path (`aclnnMatmulMxFp8Hw`, VEC32_UE8M0 + 128×4 super-tile swizzle) is implemented and automatically falls back to the functional path at run time on non-Blackwell architectures.
-An **optional native NVFP4 fp4 path** (`NVFP4_HW=1`) converts Ascend's E8M0/block-32 scale to E4M3/block-16 on the fly to reach Blackwell's fp4 tensor cores (`VEC16_UE4M3`) — measured at **3.0× the functional path** (see `../BENCHMARK.md`). It is exact while each block's scale exponent stays in E4M3's range [2⁻⁶, 2⁸] and clamps outside, so it is an opt-in fast/reduced-fidelity tier; the functional decode→fp16 path remains the default and the fidelity reference.
+An **optional native NVFP4 fp4 path** (`NVFP4_HW=1`) converts Ascend's E8M0/block-32 scale to E4M3/block-16 on the fly to reach Blackwell's fp4 tensor cores (`VEC16_UE4M3`) — measured at **3.0× the functional path** (see `BENCHMARK.md`). It is exact while each block's scale exponent stays in E4M3's range [2⁻⁶, 2⁸] and clamps outside, so it is an opt-in fast/reduced-fidelity tier; the functional decode→fp16 path remains the default and the fidelity reference.
 
 ---
 
 ## Performance Optimizations
 
-All optimizations keep tolerance-based comparison tests fully passing and retain environment-variable switches for fall-back comparisons. Performance numbers are in [`../BENCHMARK.md`](../BENCHMARK.md).
+All optimizations keep tolerance-based comparison tests fully passing and retain environment-variable switches for fall-back comparisons. Performance numbers are in [`BENCHMARK.md`](BENCHMARK.md).
 
 - **True flash attention (online softmax)**: warp-per-row, each lane holds D/32 head-dimension components, dot products reduced via `__shfl` (no `__syncthreads`),
   running max/sum/acc entirely in registers → **no S/P materialization** (workspace zeroed; large S no longer causes O(S²) memory explosion). Covers GQA/MQA/causal/mask/fp16/bf16/fp4.
@@ -83,7 +83,7 @@ All optimizations keep tolerance-based comparison tests fully passing and retain
 - **W8A8 native int8 GEMM**: cuBLASLt `CUDA_R_8I` + int32 accumulation + per-channel scale epilogue; falls back to fp16 on failure.
 - **MoE grouped GEMM**: variable-length groups overlapped across multiple streams, or native grouped GEMM (switchable).
 - **CUDA Graph**: single-token decode steps captured into a graph and replayed in a full loop, eliminating per-kernel launch overhead (decode is launch-bound).
-- **128-bit vectorized memory access**: elementwise 16B vectorized fast path + scalar fallback (`ELTWISE_NO_VEC=1` reverts). Same-card win is regime-dependent — 1.5–3× when L2-resident, a wash once DRAM-bandwidth-bound (see `../BENCHMARK.md`).
+- **128-bit vectorized memory access**: elementwise 16B vectorized fast path + scalar fallback (`ELTWISE_NO_VEC=1` reverts). Same-card win is regime-dependent — 1.5–3× when L2-resident, a wash once DRAM-bandwidth-bound (see `BENCHMARK.md`).
 
 ---
 

@@ -5,7 +5,7 @@
 Measurement methodology and results for the cann-on-gpu CUDA backend.
 
 > Data collected on **NVIDIA RTX PRO 6000 Blackwell Workstation Edition** (`sm_120`, 96 GB GDDR7 ≈1.8 TB/s, discrete card), CUDA 13.3, cuBLASLt / cuDNN backend.
-> These are **discrete-Blackwell numbers and are not comparable to the previous GB10 (`sm_121`, UMA LPDDR5X ~273 GB/s) baseline** — the high-bandwidth GDDR7 card exposes the memory-access and tensor-core gains that GB10's UMA masked. Numbers still don't extrapolate across cards; re-benchmark when switching. See [`cuda/TODO.md`](cuda/TODO.md).
+> These are **discrete-Blackwell numbers and are not comparable to the previous GB10 (`sm_121`, UMA LPDDR5X ~273 GB/s) baseline** — the high-bandwidth GDDR7 card exposes the memory-access and tensor-core gains that GB10's UMA masked. Numbers still don't extrapolate across cards; re-benchmark when switching. See [`TODO.md`](TODO.md).
 
 ## Value Proposition
 
@@ -72,10 +72,10 @@ The ACL abstraction dispatches GEMM to cuBLAS(Lt) tensor cores, so the only diff
 
 | GEMM fp16 | cann-on-gpu | native cuBLAS | cann/native |
 |---|---|---|---|
-| 512³ | 55.6 TFLOP/s | 50.9 TFLOP/s | 0.92× |
-| 2048³ | 403 TFLOP/s | 406 TFLOP/s | 1.01× |
+| 512³ | 55.6 TFLOP/s | 50.9 TFLOP/s | 1.09× |
+| 2048³ | 403 TFLOP/s | 406 TFLOP/s | 0.99× |
 | 4096³ | 435 TFLOP/s | 435 TFLOP/s | 1.00× |
-| 8192³ | 514 TFLOP/s | 528 TFLOP/s | 1.03× |
+| 8192³ | 514 TFLOP/s | 528 TFLOP/s | 0.97× |
 
 **Finding:** cann-on-gpu is **at parity with native CUDA** (within 0–3%, and faster at 512³ where its cuBLASLt heuristic happens to pick a better algo). The "compute-intensive gap" is effectively **zero** — the backend runs the same tensor-core kernels, and the ACL executor/caching-allocator overhead is negligible even at small sizes. (This comparison is only meaningful on a compute-bound card; on a bandwidth-bound part the GEMM kernel choice, not the wrapper, would dominate.)
 

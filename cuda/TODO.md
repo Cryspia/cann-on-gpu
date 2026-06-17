@@ -4,7 +4,7 @@
 
 **Operator coverage (the former Part A primary goal) is functionally complete on this machine.** Of the **1036** authoritative open-source aclnn level-2 APIs (`cann/{opbase,ops-math,ops-transformer,ops-cv,ops-nn}` at branch `9.1.0-beta.1`, frozen in `tools/official_aclnn.txt`), **1014 (~98%)** are implemented and tolerance-verified locally — against PyTorch (forward + autograd backward), CPU/closed-form references, structural invariants (QR/SVD/eigh reconstruction, RoPE/FFT/cast/MoE round-trips), and a real 2-node RoCE/HCCL path. See `README.md` → "Operator Coverage Baseline" for the per-family breakdown.
 
-**The performance work that needs a high-bandwidth / native-low-precision discrete GPU is now done and measured** on an RTX PRO 6000 Blackwell (`sm_120`, GDDR7, native fp4/fp8) — same-card A/B for every optimization, plus a new native NVFP4 fp4 GEMM path. The numbers and methodology live in [`../BENCHMARK.md`](../BENCHMARK.md) ("Optimization A/B", "Toggle-style optimization sweep", "NVFP4 native fp4 path", "cann-on-gpu vs native CUDA").
+**The performance work that needs a high-bandwidth / native-low-precision discrete GPU is now done and measured** on an RTX PRO 6000 Blackwell (`sm_120`, GDDR7, native fp4/fp8) — same-card A/B for every optimization, plus a new native NVFP4 fp4 GEMM path. The numbers and methodology live in [`BENCHMARK.md`](BENCHMARK.md) ("Optimization A/B", "Toggle-style optimization sweep", "NVFP4 native fp4 path", "cann-on-gpu vs native CUDA").
 
 **What is left below is bound to hardware this machine does not have** — a real Ascend card (for golden cross-checks and bit-exact format fidelity), or a multi-card / multi-node cluster (for scaling beyond the verified 2-node baseline) — plus one large compute-bound kernel rewrite and a couple of optional structure refactors.
 
@@ -20,7 +20,7 @@ These are about *fidelity against Ascend*, not GPU compute — they need real As
 
 ## B. Remaining performance / scaling work
 
-The same-card optimization benchmarking and the native low-precision GEMM builds are **done** (see `../BENCHMARK.md`). What remains:
+The same-card optimization benchmarking and the native low-precision GEMM builds are **done** (see `BENCHMARK.md`). What remains:
 
 - **FlashAttention-3-grade attention kernel.** `ncu` shows `k_flash_wmma` is occupancy-bound (2.84% achieved, 1 warp/block, 12.42 KB shared/block), so the win needs a full FA3-class redesign — cut shared-mem-per-warp to ≈4 KB (O in registers, smaller tiles) + warp-specialized `cp.async`/TMA/ping-pong — not a small tweak. The cuBLASLt batched perf-path (≈3× the flash path) is already the default when S/P materialization fits; flash is the memory-frugal large-S/causal path. (Also: cuBLASLt currently picks `cutlass_80_tensorop` Ampere kernels for the batched attention GEMMs on sm_120 — worth revisiting on a newer cuBLAS.)
 - **Bandwidth-reducing production fusions — remaining ops.** Residual+norm (`AddRmsNorm`/`AddLayerNorm`) is built, fixed, and quantified; fused QKV projection is quantified (up to 1.64× in the decode/small-M regime — a model-level weight-concatenation, no backend kernel needed; see BENCHMARK). Still open: further attention-materialization elimination inside the fused attention path.

@@ -78,7 +78,7 @@ make -C tests run      # 跑全部容差对拍
 
 ## 文档
 
-- **[`BENCHMARK.md`](BENCHMARK.zh-CN.md)** —— 性能基准的测量方法与结果,含在 RTX PRO 6000 Blackwell(`sm_120`)上一整套**同卡 A/B** 优化实测:TF32 GEMM 2.6×、原生 MXFP8 1.38×、从零构建的**原生 NVFP4 fp4 GEMM 达功能路径的 3.0×(1318 TFLOP/s)**、foreach 多张量融合 43–70×、以及与原生 cuBLAS **持平**(0.92–1.03×)。每个加速都是同一张卡上经 env 开关的优化-vs-朴素对比 —— 绝非跨卡比较。
+- **[`cuda/BENCHMARK.md`](cuda/BENCHMARK.zh-CN.md)** —— 性能基准的测量方法与结果,含在 RTX PRO 6000 Blackwell(`sm_120`)上一整套**同卡 A/B** 优化实测:TF32 GEMM 2.6×、原生 MXFP8 1.38×、从零构建的**原生 NVFP4 fp4 GEMM 达功能路径的 3.0×(1318 TFLOP/s)**、foreach 多张量融合 43–70×、以及与原生 cuBLAS **持平**(0.97–1.09×)。每个加速都是同一张卡上经 env 开关的优化-vs-朴素对比 —— 绝非跨卡比较。
 - **[`cuda/README.md`](cuda/README.zh-CN.md)** —— CUDA 后端的实现要点、性能优化手段、技术选型理由。
-- **[`cuda/TODO.md`](cuda/TODO.zh-CN.md)** —— 剩余路线图。算子覆盖已功能性完成(~98%),高带宽 GPU 的性能工作也已完成并实测(见 `BENCHMARK.md`),故该文件现只追踪本机硬件够不到的部分:真昇腾 golden 对照与位级格式保真、完整的 FlashAttention-3 级内核重写(需 Nsight Compute)、以及多卡/多节点扩展。
+- **[`cuda/TODO.md`](cuda/TODO.zh-CN.md)** —— 剩余路线图。算子覆盖已功能性完成(~98%),高带宽 GPU 的性能工作也已完成并实测(见 `cuda/BENCHMARK.md`),故该文件现只追踪本机硬件够不到的部分:真昇腾 golden 对照与位级格式保真、完整的 FlashAttention-3 级内核重写(需 Nsight Compute)、以及多卡/多节点扩展。
 - **[`include/README.md`](include/README.zh-CN.md)** —— API 契约头的内容与"谁实现、谁使用"。

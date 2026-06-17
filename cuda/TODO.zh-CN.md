@@ -4,7 +4,7 @@
 
 **算子覆盖(原 A 部分的首要目标)在本机已功能性完成。** 权威开源 aclnn 二级接口共 **1036** 个(`cann/{opbase,ops-math,ops-transformer,ops-cv,ops-nn}` 的 `9.1.0-beta.1` 分支,冻结于 `tools/official_aclnn.txt`),其中 **1014 个(~98%)** 已实现并在本机做了容差验证——对 PyTorch(forward + autograd backward)、CPU/闭式参考、结构不变量(QR/SVD/eigh 重构、RoPE/FFT/cast/MoE round-trip)、以及真实 2 机 RoCE/HCCL 通路。汇总与分族明细见 `README.md` 的"算子覆盖基线"。
 
-**需要高带宽 / 原生低精度独显的性能工作现已完成并实测** —— 在 RTX PRO 6000 Blackwell(`sm_120`,GDDR7,原生 fp4/fp8)上,每项优化都做了同卡 A/B,并新建了原生 NVFP4 fp4 GEMM 路径。数据与方法见 [`../BENCHMARK.md`](../BENCHMARK.md)("Optimization A/B"、"Toggle-style optimization sweep"、"NVFP4 native fp4 path"、"cann-on-gpu vs native CUDA")。
+**需要高带宽 / 原生低精度独显的性能工作现已完成并实测** —— 在 RTX PRO 6000 Blackwell(`sm_120`,GDDR7,原生 fp4/fp8)上,每项优化都做了同卡 A/B,并新建了原生 NVFP4 fp4 GEMM 路径。数据与方法见 [`BENCHMARK.md`](BENCHMARK.md)("Optimization A/B"、"Toggle-style optimization sweep"、"NVFP4 native fp4 path"、"cann-on-gpu vs native CUDA")。
 
 **下面剩的都绑定本机没有的硬件**——真昇腾卡(做 golden 对照与位级格式保真)、或多卡/多节点集群(做超出已验证 2 机基线的扩展)——外加一项大型 compute-bound 内核重写和几项可选结构重构。
 
@@ -20,7 +20,7 @@
 
 ## B. 剩余的性能 / 扩展工作
 
-同卡优化基准测试与原生低精度 GEMM 构建均**已完成**(见 `../BENCHMARK.md`)。剩下:
+同卡优化基准测试与原生低精度 GEMM 构建均**已完成**(见 `BENCHMARK.md`)。剩下:
 
 - **FlashAttention-3 级注意力内核。** `ncu` 显示 `k_flash_wmma` 占用率受限(实测 2.84%、1 warp/block、每 block 12.42 KB shared),收益需要完整 FA3 级重写——把每 warp 的 shared 砍到约 4 KB(O 放寄存器、缩 tile)+ warp 特化 `cp.async`/TMA/ping-pong——不是小改。cuBLASLt 批量 perf 路径(约 flash 的 3×)在 S/P 物化放得下时已是默认;flash 留作大 S/causal 的省内存路径。(另:本卡 cuBLASLt 给批量注意力 GEMM 选的是 `cutlass_80_tensorop` Ampere 内核——值得在更新 cuBLAS 上复查。)
 - **降访存流量的生产级融合——剩余算子。** residual+norm(`AddRmsNorm`/`AddLayerNorm`)已构建、修正确性并量化;fused QKV 投影已量化(decode/小 M 区间最高 1.64× —— 是模型层权重拼接,不需后端内核;见 BENCHMARK)。仍未做:融合注意力路径内的进一步免物化。
