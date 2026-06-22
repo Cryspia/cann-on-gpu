@@ -17,13 +17,15 @@ SHIM=../cuda/lib
 [ -x "$BIN" ] || { echo "Missing $BIN"; exit 1; }
 
 # Generate 2-rank ranktable (v1.0 style; shim counts nRanks from rank_id entries).
-# The 10.0.0.x addresses below are placeholders — replace with your two nodes' actual IPs.
-cat > "$RT" <<'JSON'
+# Set NODE0_IP / NODE1_IP to your two nodes' RoCE/IB addresses (no addresses are baked in).
+NODE0_IP="${NODE0_IP:?set NODE0_IP to rank 0's RoCE/IB IP}"
+NODE1_IP="${NODE1_IP:?set NODE1_IP to rank 1's RoCE/IB IP}"
+cat > "$RT" <<JSON
 {
   "server_count": "2",
   "server_list": [
-    {"server_id": "10.0.0.1", "device": [{"device_id": "0", "device_ip": "10.0.0.1", "rank_id": "0"}]},
-    {"server_id": "10.0.0.2", "device": [{"device_id": "0", "device_ip": "10.0.0.2", "rank_id": "1"}]}
+    {"server_id": "${NODE0_IP}", "device": [{"device_id": "0", "device_ip": "${NODE0_IP}", "rank_id": "0"}]},
+    {"server_id": "${NODE1_IP}", "device": [{"device_id": "0", "device_ip": "${NODE1_IP}", "rank_id": "1"}]}
   ],
   "status": "completed", "version": "1.0"
 }

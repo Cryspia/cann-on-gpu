@@ -56,8 +56,26 @@ set -euo pipefail
 # ----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ---- Host OS / GPU backend selection -------------------------------------------
+# Two GPU backends, auto-selected by host OS (override with BACKEND=cuda|metal):
+#   Linux  -> cuda  (AscendCL->CUDA;  needs NVIDIA driver + CUDA 13 + cuDNN/NCCL/CUTLASS)
+#   Darwin -> metal (AscendCL->Metal; needs full Xcode + the downloadable Metal Toolchain — NO global xcode-select change)
+# The miniforge env, the ACL/aclnn/HCCL header contract, and the no-PATH-pollution design are shared by both paths.
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+case "$OS" in
+    Darwin) BACKEND="${BACKEND:-metal}" ;;
+    *)      BACKEND="${BACKEND:-cuda}"  ;;
+esac
+
 MINIFORGE_DIR="${MINIFORGE_DIR:-$HOME/miniforge3}"
-MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh"
+# miniforge installer is OS/arch-specific; conda-forge publishes an Apple-Silicon (MacOSX-arm64) build.
+case "$OS" in
+    Darwin) MINIFORGE_OS="MacOSX" ;;
+    *)      MINIFORGE_OS="Linux"  ;;
+esac
+MINIFORGE_INSTALLER_NAME="Miniforge3-${MINIFORGE_OS}-${ARCH}.sh"
+MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/${MINIFORGE_INSTALLER_NAME}"
 
 ENV_NAME="${ENV_NAME:-cann-gpu}"
 PY_VER="${PY_VER:-3.12}"
@@ -91,7 +109,19 @@ CANN_URL="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.T1
 # (explorer directory first, then its parent; download only as last resort)
 CANN_RUN="${CANN_RUN:-}"
 ACL_SRC_INCLUDE="${ACL_SRC_INCLUDE:-}"         # explicit include root containing acl/acl.h
+ACL_SRC_SSH="${ACL_SRC_SSH:-}"                 # optional rsync source for ACL headers, e.g. user@host:/path/to/include
+                                               # (most reliable on macOS, where extracting a Linux CANN .run is fragile)
 SKIP_ACL_HEADERS="${SKIP_ACL_HEADERS:-0}"
+
+# ---- Metal backend (macOS) configuration ----
+# Xcode supplies the Metal compiler; on Xcode 16+/26 the Metal Toolchain is a *downloadable* cryptex component
+# mounted under /var/run/com.apple.security.cryptexd/. We never run `xcode-select -s` (no global toolchain
+# switch) — env.sh scopes Xcode for this project's builds only via DEVELOPER_DIR.
+XCODE_APP="${XCODE_APP:-/Applications/Xcode.app}"
+XCODE_DEV="${XCODE_DEV:-${XCODE_APP}/Contents/Developer}"
+METAL_STD="${METAL_STD:-metal3.1}"                 # MSL std target (M-series + Metal 3.1+ has native bfloat)
+SKIP_METAL_DOWNLOAD="${SKIP_METAL_DOWNLOAD:-0}"    # 1 = never sudo-download the toolchain; only detect + instruct
+METAL_BIN=""                                       # resolved by check_metal() to the cryptex Metal Toolchain bin
 
 ENV_SH="${SCRIPT_DIR}/env.sh"
 
@@ -132,8 +162,8 @@ install_miniforge() {
         log "Already present, skipping: $MINIFORGE_DIR"
         return
     fi
-    local installer="/tmp/Miniforge3-Linux-aarch64.sh"
-    log "Downloading miniforge installer..."
+    local installer="/tmp/${MINIFORGE_INSTALLER_NAME}"
+    log "Downloading miniforge installer (${MINIFORGE_INSTALLER_NAME})..."
     if command -v curl >/dev/null 2>&1; then
         curl -fL -o "$installer" "$MINIFORGE_URL"
     else
@@ -205,6 +235,66 @@ check_cuda() {
     log "GPU_ARCH = ${GPU_ARCH} (passed to nvcc -arch; Blackwell tensor-core/CUTLASS may need ${GPU_ARCH}a variant)"
 }
 
+# ----------------------------------------------------------------------------
+# Step 3 (Metal): Validate the Apple Metal toolchain (macOS) — NO global xcode-select change
+#   Xcode 16+/26 ships the Metal compiler as a downloadable cryptex "Metal Toolchain" component, mounted
+#   under /var/run/com.apple.security.cryptexd/. `xcrun metal` can fail to resolve it when the *persisted*
+#   global xcode-select points at CommandLineTools; we locate and invoke the real cryptex metal/metallib
+#   directly, and scope Xcode for the build via DEVELOPER_DIR (project-local) instead of switching globally.
+# ----------------------------------------------------------------------------
+# Locate the cryptex-mounted Metal Toolchain bin dir that has a *working* `metal`; empty if not installed.
+find_metal_bin() {
+    local d
+    for d in /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-*/Metal.xctoolchain/usr/bin; do
+        [ -x "$d/metal" ] || continue
+        if DEVELOPER_DIR="$XCODE_DEV" "$d/metal" --version >/dev/null 2>&1; then echo "$d"; return; fi
+    done
+}
+
+# True iff the Xcode license has been accepted (xcodebuild emits a 'license' error otherwise).
+xcode_license_ok() {
+    local out
+    out="$(DEVELOPER_DIR="$XCODE_DEV" "$XCODE_DEV/usr/bin/xcodebuild" -version 2>&1)" || true
+    ! printf '%s' "$out" | grep -qi 'license'
+}
+
+check_metal() {
+    step "Step 3/7: Validate Apple Metal toolchain (macOS, project-scoped — no global xcode-select change)"
+    [ -d "$XCODE_DEV" ] || die "Xcode not found at ${XCODE_APP}. Install full Xcode from the App Store (Command Line Tools alone do NOT ship the Metal compiler), or set XCODE_APP=..."
+    log "Xcode developer dir: ${XCODE_DEV}"
+    log "  (scoped via DEVELOPER_DIR in env.sh; your global 'xcode-select -p' is left untouched)"
+
+    # 3a) Xcode license — one-time, needs sudo. We DETECT and prompt with the exact command (we never sudo silently here).
+    if ! xcode_license_ok; then
+        warn "Xcode license has not been accepted yet."
+        echo "      Run this one-time command (records the license agreement ONLY — does NOT repoint clang/git/make):"
+        echo "          sudo \"${XCODE_DEV}/usr/bin/xcodebuild\" -license accept"
+        die "Re-run ./deploy.sh after accepting the license."
+    fi
+    log "Xcode license: accepted"
+
+    # 3b) Metal Toolchain component — downloadable on Xcode 16+/26.
+    METAL_BIN="$(find_metal_bin || true)"
+    if [ -z "$METAL_BIN" ]; then
+        if [ "$SKIP_METAL_DOWNLOAD" = "1" ]; then
+            die "Metal Toolchain not installed and SKIP_METAL_DOWNLOAD=1. Install it manually: sudo \"${XCODE_DEV}/usr/bin/xcodebuild\" -downloadComponent MetalToolchain"
+        fi
+        warn "Metal Toolchain component not installed; downloading now (needs sudo, ~hundreds of MB)..."
+        echo "      sudo \"${XCODE_DEV}/usr/bin/xcodebuild\" -downloadComponent MetalToolchain"
+        sudo "${XCODE_DEV}/usr/bin/xcodebuild" -downloadComponent MetalToolchain \
+            || warn "Automatic download failed — run the command above manually, then re-run ./deploy.sh"
+        METAL_BIN="$(find_metal_bin || true)"
+        [ -n "$METAL_BIN" ] || die "Metal Toolchain still not resolvable after download — re-run ./deploy.sh once the download finishes."
+    fi
+    log "Metal Toolchain ready: ${METAL_BIN}"
+    log "  $(DEVELOPER_DIR="$XCODE_DEV" "$METAL_BIN/metal" --version 2>&1 | head -1)"
+
+    # 3c) Apple GPU info (informational). Unified memory: with MTLStorageModeShared the aclrt device pointer == host pointer.
+    local gpu
+    gpu="$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2; exit}')"
+    log "GPU: ${gpu:-Apple GPU}   (unified memory — host/device share one address space)"
+}
+
 # Run python inside the env; print the directory of a given package (empty if not found)
 py_pkg_dir() {
     load_conda; conda activate "$ENV_NAME"
@@ -238,17 +328,25 @@ install_build_tools() {
     #     pytest   — test framework (aligned with cann-api-explorer style)
     #     pybind11 — expose .so to Python, reusing the explorer call convention
     #     cuda-python — Python bindings for the Driver API (for future PTX module experiments)
-    log "pip: install numpy / pytest / pybind11 / cuda-python"
-    pip install --no-input numpy pytest pybind11 cuda-python \
-        || warn "Some Python dependencies failed to install (does not affect C++/CUDA build itself)"
+    #     cuda-python — Driver API bindings (CUDA backend only; not meaningful on Metal)
+    local pyextra=""; [ "$BACKEND" = "cuda" ] && pyextra="cuda-python"
+    log "pip: install numpy / pytest / pybind11${pyextra:+ / cuda-python}"
+    pip install --no-input numpy pytest pybind11 $pyextra \
+        || warn "Some Python dependencies failed to install (does not affect C++/GPU build itself)"
 
     #     torch — independent PyTorch reference oracle for tools/torch_golden.sh, the default
-    #             verification path. The oracles only do CPU float64 math, so the CUDA build is
-    #             irrelevant: prefer the wheel matching the card's CUDA major, fall back to the CPU wheel.
+    #             verification path. The oracles only do CPU float64 math, so the GPU build is
+    #             irrelevant: on CUDA prefer the wheel matching the card's CUDA major, else the CPU
+    #             wheel; on Metal/macOS the default wheel (CPU/MPS) is correct.
     log "pip: install torch (PyTorch reference oracle for torch_golden.sh)"
-    pip install --no-input --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}0" torch \
-        || pip install --no-input --index-url https://download.pytorch.org/whl/cpu torch \
-        || warn "PyTorch oracle failed to install (torch_golden.sh will skip; other verification unaffected)"
+    if [ "$BACKEND" = "cuda" ]; then
+        pip install --no-input --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}0" torch \
+            || pip install --no-input --index-url https://download.pytorch.org/whl/cpu torch \
+            || warn "PyTorch oracle failed to install (torch_golden.sh will skip; other verification unaffected)"
+    else
+        pip install --no-input torch \
+            || warn "PyTorch oracle failed to install (torch_golden.sh will skip; other verification unaffected)"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -444,22 +542,32 @@ install_acl_headers() {
     fi
     mkdir -p "$inc"
 
-    # Source 1: explicit ACL_SRC_INCLUDE
-    local src=""
-    if [ -n "$ACL_SRC_INCLUDE" ] && [ -f "$ACL_SRC_INCLUDE/acl/acl.h" ]; then
-        src="$ACL_SRC_INCLUDE"
-    else
-        # Source 2: installed cannsim toolkit (fast local path, most complete, no download/extraction needed)
-        src="$(find_cannsim_include || true)"
+    # Source 0 (optional): rsync the header tree from a peer that already has it installed
+    # (e.g. ACL_SRC_SSH=user@host:/path/to/acl/include). Most reliable on macOS, where extracting a
+    # Linux CANN .run is fragile — the headers themselves are OS/arch-independent.
+    if [ -n "$ACL_SRC_SSH" ] && [ ! -f "$inc/acl/acl.h" ]; then
+        log "Fetching ACL headers via rsync from: $ACL_SRC_SSH"
+        rsync -a "${ACL_SRC_SSH%/}/" "$inc/" 2>/dev/null || warn "  rsync from $ACL_SRC_SSH failed; trying other sources"
     fi
 
-    if [ -n "$src" ] && [ -f "$src/acl/acl.h" ]; then
-        log "Reusing installed toolkit headers (copying to make env self-contained): $src"
-        copy_acl_subdirs "$src" "$inc"
-    else
-        # Source 3: extract from .run archive
-        log "No installed toolkit headers found, extracting from CANN .run archive"
-        extract_acl_from_run "$inc"
+    if [ ! -f "$inc/acl/acl.h" ]; then
+        # Source 1: explicit ACL_SRC_INCLUDE
+        local src=""
+        if [ -n "$ACL_SRC_INCLUDE" ] && [ -f "$ACL_SRC_INCLUDE/acl/acl.h" ]; then
+            src="$ACL_SRC_INCLUDE"
+        else
+            # Source 2: installed cannsim toolkit (fast local path, most complete, no download/extraction needed)
+            src="$(find_cannsim_include || true)"
+        fi
+
+        if [ -n "$src" ] && [ -f "$src/acl/acl.h" ]; then
+            log "Reusing installed toolkit headers (copying to make env self-contained): $src"
+            copy_acl_subdirs "$src" "$inc"
+        else
+            # Source 3: extract from .run archive
+            log "No installed toolkit headers found, extracting from CANN .run archive"
+            extract_acl_from_run "$inc"
+        fi
     fi
 
     [ -f "$inc/acl/acl.h" ] || die "ACL header installation failed: $inc/acl/acl.h does not exist"
@@ -547,6 +655,53 @@ EOF
     log "  NCCL_DIR=${nccl_dir:-<not installed>}"
     log "  CUTLASS_INCLUDE=${cutlass_inc:-<not installed>}"
     log "  ACL_INCLUDE=${acl_inc:-<not installed>} (hccl/ is under it)"
+}
+
+# Metal variant of env.sh: scopes Xcode via DEVELOPER_DIR (no global xcode-select change),
+# exports the cryptex metal/metallib paths, MSL std, macOS SDK, and the shared ACL header contract.
+write_env_sh_metal() {
+    step "Step 6/7: Generate env.sh (Metal backend)"
+    load_conda; conda activate "$ENV_NAME"
+    local acl_inc=""; [ -f "$(acl_target)/include/acl/acl.h" ] && acl_inc="$(acl_target)/include"
+    local sdk; sdk="$(DEVELOPER_DIR="$XCODE_DEV" xcrun -sdk macosx --show-sdk-path 2>/dev/null || true)"
+
+    cat > "$ENV_SH" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by deploy.sh (BACKEND=metal) — source for all build/runtime paths on macOS/Metal.
+# Usage:
+#   source ${MINIFORGE_DIR}/etc/profile.d/conda.sh && conda activate ${ENV_NAME}
+#   source ${ENV_SH}
+#   make -C metal            # -> metal/lib/libascendcl.dylib + metal/lib/default.metallib
+
+export CANN_GPU_ENV="${ENV_NAME}"
+export CANN_GPU_BACKEND="metal"
+
+# ---- Apple Metal toolchain (PROJECT-SCOPED: no global xcode-select change) ----
+# DEVELOPER_DIR scopes Xcode to this shell/build only; your global 'xcode-select -p' stays as-is.
+export DEVELOPER_DIR="${XCODE_DEV}"
+# The Metal Toolchain is a cryptex mount whose path can change across reboots — re-resolve at source time.
+export METAL_BIN="\$(ls -d /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-*/Metal.xctoolchain/usr/bin 2>/dev/null | head -1)"
+export METAL="\${METAL_BIN}/metal"
+export METALLIB="\${METAL_BIN}/metallib"
+export METAL_STD="${METAL_STD}"
+export MACOSX_SDK="${sdk}"
+if [ -z "\${METAL_BIN}" ]; then
+    echo "[env.sh] WARN: Metal Toolchain not mounted. Install: sudo \"${XCODE_DEV}/usr/bin/xcodebuild\" -downloadComponent MetalToolchain" >&2
+fi
+
+# ---- ACL/aclnn/HCCL headers (path-A API contract; compile-time -I only; identical to the CUDA backend) ----
+export ACL_INCLUDE="${acl_inc}"
+
+# Minimal build commands:
+#   \${METAL} -std=\${METAL_STD} -c kernel.metal -o kernel.air && \${METALLIB} kernel.air -o default.metallib
+#   clang++ -std=c++17 -ObjC++ -fobjc-arc -I"\${ACL_INCLUDE}" op.mm -framework Metal -framework Foundation \\
+#           -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Accelerate
+EOF
+    chmod +x "$ENV_SH"
+    log "Generated: $ENV_SH"
+    log "  BACKEND=metal  DEVELOPER_DIR=${XCODE_DEV} (project-scoped; global xcode-select untouched)"
+    log "  METAL_BIN=${METAL_BIN}"
+    log "  ACL_INCLUDE=${acl_inc:-<not installed>}"
 }
 
 # ----------------------------------------------------------------------------
@@ -735,6 +890,96 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
+# Step 7 (Metal): Smoke tests — proves the full Metal build/run chain end-to-end
+#   1) metal compile+link (.metal -> .air -> .metallib)
+#   2) Objective-C++ host (the backend's host layer is .mm too — MPS/MPSGraph are Objective-C):
+#      create MTLDevice, load the metallib, dispatch a vector-add, verify the result
+#   3) ACL header contract syntax check (shared with the CUDA backend; no Ascend runtime link)
+# ----------------------------------------------------------------------------
+smoke_test_metal() {
+    step "Step 7/7: Smoke tests (Metal)"
+    load_conda; conda activate "$ENV_NAME"
+    [ -f "$ENV_SH" ] || die "$ENV_SH not found; run deploy first"
+    # shellcheck disable=SC1090
+    source "$ENV_SH"
+    [ -n "${METAL_BIN:-}" ] && [ -x "${METAL_BIN}/metal" ] || die "Metal toolchain not resolved; re-run ./deploy.sh"
+    local work; work="$(mktemp -d)"
+
+    # 7a) Metal compiler chain: .metal -> .air -> .metallib
+    log "Test 1: metal compile + link (.metal -> .air -> .metallib, -std=${METAL_STD})"
+    cat > "$work/vadd.metal" <<'EOF'
+#include <metal_stdlib>
+using namespace metal;
+kernel void vadd(device const float* a [[buffer(0)]],
+                 device const float* b [[buffer(1)]],
+                 device float* c       [[buffer(2)]],
+                 uint i [[thread_position_in_grid]]) { c[i] = a[i] + b[i]; }
+EOF
+    if "$METAL_BIN/metal" -std="${METAL_STD}" -c "$work/vadd.metal" -o "$work/vadd.air" >"$work/metal.build.log" 2>&1 \
+        && "$METAL_BIN/metallib" "$work/vadd.air" -o "$work/vadd.metallib" >>"$work/metal.build.log" 2>&1; then
+        log "  Metal compile/link OK ($(wc -c < "$work/vadd.metallib" | tr -d ' ') byte metallib)"
+    else
+        warn "  Metal compile/link failed (see $work/metal.build.log)"; tail -10 "$work/metal.build.log" | sed 's/^/      /'
+    fi
+
+    # 7b) Objective-C++ host dispatch + result check
+    log "Test 2: Metal runtime (Objective-C++ host dispatches the kernel, verifies result)"
+    cat > "$work/run.mm" <<EOF
+#import <Metal/Metal.h>
+#import <Foundation/Foundation.h>
+#include <cstdio>
+int main(){ @autoreleasepool {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    if(!dev){ printf("no Metal device\n"); return 1; }
+    NSError* err=nil;
+    id<MTLLibrary> lib=[dev newLibraryWithURL:[NSURL fileURLWithPath:@"${work}/vadd.metallib"] error:&err];
+    if(!lib){ printf("metallib load failed\n"); return 2; }
+    id<MTLComputePipelineState> pso=[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"vadd"] error:&err];
+    id<MTLCommandQueue> q=[dev newCommandQueue];
+    const int N=1024; size_t sz=N*sizeof(float);
+    id<MTLBuffer> a=[dev newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b=[dev newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    id<MTLBuffer> c=[dev newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    float* pa=(float*)a.contents; float* pb=(float*)b.contents; float* pc=(float*)c.contents;
+    for(int i=0;i<N;i++){ pa[i]=i; pb[i]=2*i; }
+    id<MTLCommandBuffer> cb=[q commandBuffer];
+    id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:a offset:0 atIndex:0]; [enc setBuffer:b offset:0 atIndex:1]; [enc setBuffer:c offset:0 atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(N,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    for(int i=0;i<N;i++) if(pc[i]!=3.0f*i){ printf("MISMATCH at %d\n",i); return 3; }
+    printf("METAL OK device=%s\n",[[dev name] UTF8String]); return 0;
+}}
+EOF
+    if clang++ -std=c++17 -ObjC++ -fobjc-arc "$work/run.mm" -framework Metal -framework Foundation -o "$work/run" >"$work/run.build.log" 2>&1 \
+        && "$work/run" | grep -q "METAL OK"; then
+        log "  Metal runtime OK: device created, metallib loaded, kernel ran, result verified"
+    else
+        warn "  Metal runtime test failed (see $work/run.build.log)"; tail -15 "$work/run.build.log" | sed 's/^/      /'
+    fi
+
+    # 7c) ACL header contract (shared with CUDA backend; syntax-only, no Ascend runtime link)
+    if [ -n "${ACL_INCLUDE:-}" ] && [ -f "${ACL_INCLUDE}/acl/acl.h" ]; then
+        log "Test 3: ACL header compilation (#include <acl/acl.h>, syntax-only)"
+        printf '#include <acl/acl.h>\nint main(void){ (void)aclrtMalloc; (void)aclrtMemcpy; return 0; }\n' > "$work/acl_chk.c"
+        if cc -fsyntax-only -I"${ACL_INCLUDE}" "$work/acl_chk.c" >"$work/acl.build.log" 2>&1; then
+            log "  ACL headers compile OK (API contract ready)"
+        else
+            warn "  ACL header syntax check failed (see $work/acl.build.log)"; tail -10 "$work/acl.build.log" | sed 's/^/      /'
+        fi
+    else
+        warn "Test 3: skipping ACL header self-check (not installed)"
+    fi
+
+    echo; log "${c_grn}Metal smoke tests complete.${c_reset}"; echo
+    echo "To use this environment next time:"
+    echo "  source ${MINIFORGE_DIR}/etc/profile.d/conda.sh && conda activate ${ENV_NAME}"
+    echo "  source ${ENV_SH}"
+    echo "  make -C metal            # build metal/lib/libascendcl.dylib (once the backend lands)"
+}
+
+# ----------------------------------------------------------------------------
 # Uninstall: remove env only (miniforge and CUTLASS source are preserved)
 # ----------------------------------------------------------------------------
 do_uninstall() {
@@ -757,14 +1002,23 @@ do_uninstall() {
 # Main flow
 # ----------------------------------------------------------------------------
 do_deploy() {
+    log "Backend: ${BACKEND}  (host: ${OS}/${ARCH})"
     install_miniforge
     create_env
-    check_cuda
-    install_build_tools
-    install_op_backends
-    install_acl_headers
-    write_env_sh
-    smoke_test
+    if [ "$BACKEND" = "metal" ]; then
+        check_metal
+        install_build_tools          # cmake/ninja + numpy/pytest/pybind11 (no cuda-python); no cuDNN/NCCL/CUTLASS
+        install_acl_headers
+        write_env_sh_metal
+        smoke_test_metal
+    else
+        check_cuda
+        install_build_tools
+        install_op_backends
+        install_acl_headers
+        write_env_sh
+        smoke_test
+    fi
 }
 
 usage() {
@@ -774,7 +1028,7 @@ usage() {
 main() {
     case "${1:-deploy}" in
         deploy|"")    do_deploy ;;
-        test)         check_cuda; smoke_test ;;
+        test)         if [ "$BACKEND" = "metal" ]; then check_metal; smoke_test_metal; else check_cuda; smoke_test; fi ;;
         uninstall)    do_uninstall ;;
         -h|--help|help) usage ;;
         *) die "Unknown command: $1 (available: deploy | test | uninstall)" ;;

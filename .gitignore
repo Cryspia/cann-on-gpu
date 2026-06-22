@@ -1,9 +1,14 @@
 # Build artifacts and local generated files (not source of truth)
 cuda/lib/
+metal/lib/
+metal/build/
 tests/bin/
 third_party/
 *.o
 *.so
+*.dylib
+*.metallib
+*.air
 env.sh
 __pycache__/
 *.pyc

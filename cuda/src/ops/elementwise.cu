@@ -665,8 +665,8 @@ aclnnStatus run_elementwise(aclOpExecutor *e, void *ws, cudaStream_t s) {
         case OP_HEAVISIDE:  DO_BIN(FHeaviside); break;
         case OP_LERP:       DO_BIN(FLerp); break;
         case OP_LOGADDEXP2: DO_BIN(FLogaddexp2); break;
-        case OP_FLOORDIV:   DO_BIN(FFloorDiv); break;
-        case OP_RSUB:       DO_BIN(FRsub); break;
+        case OP_FLOORDIV:   if (e->b) { DO_BIN(FFloorDiv); } else { DISPATCH_SCALAR(FFloorDiv) } break;   // scalar variant (aclnnFloorDivides) has b==null
+        case OP_RSUB:       if (e->b) { DO_BIN(FRsub); } else { DISPATCH_SCALAR(FRsub) } break;          // scalar variant (aclnnRsubs) has b==null
         case OP_ROUNDDEC:   DISPATCH_SCALAR(FRoundDec) break;
         case OP_NANTONUM:   DISPATCH_SCALAR3(FNanToNum) break;
         case OP_PRELU:      DO_BIN(FPrelu); break;

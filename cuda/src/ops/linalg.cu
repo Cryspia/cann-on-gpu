@@ -19,6 +19,7 @@ __global__ void k_det_from_lu(const float *lu, const int *ipiv, float *out, int6
     double d=1.0; int swaps=0; for(int64_t i=0;i<n;i++){ d*=lu[i*n+i]; if(ipiv[i]!=(int)(i+1)) swaps++; } *out=(float)(swaps&1 ? -d : d);
 }
 __global__ void k_zero_strict_upper(float *a, int64_t n){ int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n*n) return; int64_t r=i/n,c=i%n; if(c>r) a[i]=0.f; }
+__global__ void k_zero_strict_lower(float *a, int64_t n){ int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n*n) return; int64_t r=i/n,c=i%n; if(c<r) a[i]=0.f; }
 __global__ void k_cross(const float *a, const float *b, float *o, int64_t batch){
     int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=batch) return; const float *x=a+i*3,*y=b+i*3; float *z=o+i*3;
     z[0]=x[1]*y[2]-x[2]*y[1]; z[1]=x[2]*y[0]-x[0]*y[2]; z[2]=x[0]*y[1]-x[1]*y[0];
@@ -75,10 +76,13 @@ aclnnStatus aclnnCholesky(void *ws, uint64_t, aclOpExecutor *e, aclrtStream s) {
     auto st=(cudaStream_t)s; int64_t n=e->n; cusolverDnHandle_t h; cusolverDnCreate(&h); cusolverDnSetStream(h, st);
     int *info=(int*)ws; float *work=(float*)(info+1);
     cudaMemcpyAsync(e->out->data, e->a->data, (size_t)n*n*sizeof(float), cudaMemcpyDeviceToDevice, st);
-    int lwork=0; cusolverDnSpotrf_bufferSize(h, CUBLAS_FILL_MODE_UPPER, n, (float*)e->out->data, n, &lwork);
-    // UPPER in col-major == lower in row-major -> reading row-major gives L with A=LL^T
-    cusolverDnSpotrf(h, CUBLAS_FILL_MODE_UPPER, n, (float*)e->out->data, n, work, lwork, info);
-    k_zero_strict_upper<<<nb(n*n),TH,0,st>>>((float*)e->out->data, n);
+    // e->m: 0 = lower factor (FILL_UPPER col-major == lower row-major, A=LL^T);
+    //       1 = upper factor (FILL_LOWER col-major == upper row-major, A=R^T R) — aclnnLinalgCholesky(upper=true)
+    auto fill = e->m ? CUBLAS_FILL_MODE_LOWER : CUBLAS_FILL_MODE_UPPER;
+    int lwork=0; cusolverDnSpotrf_bufferSize(h, fill, n, (float*)e->out->data, n, &lwork);
+    cusolverDnSpotrf(h, fill, n, (float*)e->out->data, n, work, lwork, info);
+    if (e->m) k_zero_strict_lower<<<nb(n*n),TH,0,st>>>((float*)e->out->data, n);
+    else      k_zero_strict_upper<<<nb(n*n),TH,0,st>>>((float*)e->out->data, n);
     cudaStreamSynchronize(st); cusolverDnDestroy(h);
     return done(e);
 }

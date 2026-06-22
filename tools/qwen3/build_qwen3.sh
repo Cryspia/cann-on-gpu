@@ -34,8 +34,11 @@ else
 fi
 
 echo "[build] compiling shim forward harness"
-g++ -std=c++17 -O2 -I"$ACL_INCLUDE" -I../../include run_qwen3.cpp \
-    -L../../cuda/lib -lascendcl -Wl,-rpath,"$(cd ../../cuda/lib && pwd)" -o run_qwen3 || exit 1
+# Backend-aware: Darwin -> Metal (clang++ + ../../metal), else CUDA (g++ + ../../cuda). Override with BACKEND_DIR.
+if [ "$(uname -s)" = "Darwin" ]; then BACKEND_DIR="${BACKEND_DIR:-../../metal}"; CXX="${CXX:-clang++}";
+else BACKEND_DIR="${BACKEND_DIR:-../../cuda}"; CXX="${CXX:-g++}"; fi
+"$CXX" -std=c++17 -O2 -I"$ACL_INCLUDE" -I../../include run_qwen3.cpp \
+    -L"$BACKEND_DIR/lib" -lascendcl -Wl,-rpath,"$(cd "$BACKEND_DIR/lib" && pwd)" -o run_qwen3 || exit 1
 
 echo "[run] shim forward vs HF reference"
 ./run_qwen3 data

@@ -243,6 +243,7 @@ __global__ void k_axpy(const float*x,const float*y,float*o,int64_t n,float al){ 
 __global__ void k_leftshifts(const int32_t*a,int32_t*o,int64_t n,int sh){ int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) o[i]=a[i]<<sh; }
 __global__ void k_isin_ts(const float*t,float v,uint8_t*o,int64_t n){ int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) o[i]=(t[i]==v); }
 __global__ void k_angle(const float*re,const float*im,float*o,int64_t n){ int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) o[i]=atan2f(im?im[i]:0.f,re[i]); }
+__global__ void k_angle_il(const float*c,float*o,int64_t n){ int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) o[i]=atan2f(c[2*i+1],c[2*i]); }  // interleaved (re,im) pairs
 // complex stored interleaved [...,2]: Real → real part; Complex(re,im); Polar(abs,angle)
 __global__ void k_real(const float*c,float*o,int64_t n){ int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) o[i]=c[2*i]; }
 __global__ void k_complex(const float*re,const float*im,float*o,int64_t n){ int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n){ o[2*i]=re[i]; o[2*i+1]=im[i]; } }
@@ -284,7 +285,7 @@ __global__ void k_relpos_softmax(const float*qk,const float*relpos,const float*m
 extern "C" {
 
 // ---- linalg naming forwards ----
-aclnnStatus aclnnLinalgCholeskyGetWorkspaceSize(const aclTensor *self, bool upper, aclTensor *out, uint64_t *ws, aclOpExecutor **ex){ (void)upper; return aclnnCholeskyGetWorkspaceSize(self, out, ws, ex); }
+aclnnStatus aclnnLinalgCholeskyGetWorkspaceSize(const aclTensor *self, bool upper, aclTensor *out, uint64_t *ws, aclOpExecutor **ex){ aclnnStatus st=aclnnCholeskyGetWorkspaceSize(self, out, ws, ex); if(st==ACLNN_SUCCESS && ex && *ex) (*ex)->m = upper?1:0; return st; }
 aclnnStatus aclnnLinalgCholesky(void *w,uint64_t wz,aclOpExecutor*e,aclrtStream s){ return aclnnCholesky(w,wz,e,s); }
 aclnnStatus aclnnLinalgQrGetWorkspaceSize(const aclTensor *A, int64_t mode, aclTensor *Q, aclTensor *R, uint64_t *ws, aclOpExecutor **ex){ (void)mode; return aclnnQrGetWorkspaceSize(A, Q, R, ws, ex); }
 aclnnStatus aclnnLinalgQr(void *w,uint64_t wz,aclOpExecutor*e,aclrtStream s){ return aclnnQr(w,wz,e,s); }
@@ -364,7 +365,7 @@ aclnnStatus aclnnAngleV2GetWorkspaceSize(const aclTensor *self, aclTensor *out, 
     if(!self||!out||!ex) return ACLNN_ERR_PARAM_NULLPTR; auto*e=new aclOpExecutor(); e->a=self; e->out=out; if(ws)*ws=0; *ex=e; return ACLNN_SUCCESS; }
 aclnnStatus aclnnAngleV2(void*,uint64_t,aclOpExecutor*e,aclrtStream s){ int64_t n=e->out->numel(); auto st=(cudaStream_t)s;
     // treat input as interleaved (re,im) pairs
-    k_angle<<<nb(n),TH,0,st>>>((const float*)e->a->data,((const float*)e->a->data)+1,(float*)e->out->data,n); return done(e); }
+    k_angle_il<<<nb(n),TH,0,st>>>((const float*)e->a->data,(float*)e->out->data,n); return done(e); }
 
 // ---- VarCorrection ----
 aclnnStatus aclnnVarCorrectionGetWorkspaceSize(const aclTensor *self, const aclIntArray *dim, int64_t correction, bool keepDim, aclTensor *out, uint64_t *ws, aclOpExecutor **ex){
