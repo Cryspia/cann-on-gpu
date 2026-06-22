@@ -335,13 +335,15 @@ install_build_tools() {
         || warn "Some Python dependencies failed to install (does not affect C++/GPU build itself)"
 
     #     torch — independent PyTorch reference oracle for tools/torch_golden.sh, the default
-    #             verification path. The oracles only do CPU float64 math, so the GPU build is
-    #             irrelevant: on CUDA prefer the wheel matching the card's CUDA major, else the CPU
-    #             wheel; on Metal/macOS the default wheel (CPU/MPS) is correct.
-    log "pip: install torch (PyTorch reference oracle for torch_golden.sh)"
+    #             verification path. The oracles only do CPU float64 math, so install the CPU-only
+    #             wheel: a CUDA torch wheel pins its own nvidia-cudnn-cu / nvidia-nccl-cu and would
+    #             DOWNGRADE the cuDNN/NCCL this script just installed for the CUDA backend (a different
+    #             cuDNN picks different conv algorithms and can break tight tolerance tests). The CPU
+    #             wheel has no nvidia-* deps, so it never perturbs the backend's GPU libraries. On
+    #             Metal/macOS the default wheel is already CPU/MPS with no nvidia deps.
+    log "pip: install torch (CPU-only PyTorch reference oracle for torch_golden.sh)"
     if [ "$BACKEND" = "cuda" ]; then
-        pip install --no-input --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}0" torch \
-            || pip install --no-input --index-url https://download.pytorch.org/whl/cpu torch \
+        pip install --no-input --index-url https://download.pytorch.org/whl/cpu torch \
             || warn "PyTorch oracle failed to install (torch_golden.sh will skip; other verification unaffected)"
     else
         pip install --no-input torch \
